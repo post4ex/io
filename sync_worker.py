@@ -171,19 +171,20 @@ def main():
     # Track file modification times
     last_mtimes = {}
     
-    # Initial scan logging
+    # Initial recursive scan logging
     try:
-        if os.path.exists(DATA_PATH):
-            files = [f for f in os.listdir(DATA_PATH) if f.endswith(".manager")]
-            logging.info(f"Initial directory scan found {len(files)} database files: {files}")
+        logging.info("Scanning /mnt/bucket recursively for any .manager files...")
+        found_files = []
+        for root, dirs, files in os.walk("/mnt/bucket"):
             for f in files:
-                filepath = os.path.join(DATA_PATH, f)
-                mtime = os.path.getmtime(filepath)
-                logging.info(f"  - File '{f}': mtime={mtime}")
-        else:
-            logging.warning(f"Data path '{DATA_PATH}' does not exist on startup.")
+                if f.endswith(".manager"):
+                    fullpath = os.path.join(root, f)
+                    mtime = os.path.getmtime(fullpath)
+                    found_files.append((fullpath, mtime))
+                    logging.info(f"  - Found database: {fullpath} (mtime={mtime})")
+        logging.info(f"Total .manager files found on volume mount: {len(found_files)}")
     except Exception as e:
-        logging.error(f"Error during initial directory scan: {e}")
+        logging.error(f"Error during recursive directory walk: {e}")
     
     while True:
         try:

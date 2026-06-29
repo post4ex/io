@@ -53,22 +53,15 @@ def save_checkpoint(branch, ticks):
     except Exception as e:
         logging.error(f"Failed to save checkpoint file for {branch}: {e}")
 
-def get_branch_api_key(branch):
-    # Lookup [BRANCH]_MANAGER_API_KEY in environment variables
-    # e.g., DDN_MANAGER_API_KEY
-    var_name = f"{branch.upper()}_MANAGER_API_KEY"
-    return os.getenv(var_name)
-
 def check_database_changes(filename):
     # Filename format: [BRANCH]_BRANCH.manager (e.g. DDN_BRANCH.manager)
     # Extract branch code by splitting on underscore
     branch = filename.split("_")[0].upper()
     db_path = os.path.join(DATA_PATH, filename)
     
-    api_key = get_branch_api_key(branch)
-    if not api_key:
-        logging.warning(f"Skipping database '{filename}': no API key found for branch '{branch}' in environment (Expected {branch}_MANAGER_API_KEY)")
-        return
+    io_sync_key = os.getenv("IO_SYNC_KEY")
+    if not io_sync_key:
+        logging.error("IO_SYNC_KEY is not configured in the environment. Webhook authentication will fail.")
 
     # Load last processed ticks
     if branch not in checkpoints:
@@ -129,10 +122,13 @@ def check_database_changes(filename):
                 })
                 
         # Send Webhook to App Space
-        payload = {"changes": changes}
+        payload = {
+            "branch": branch.lower(),
+            "changes": changes
+        }
         headers = {
             "Content-Type": "application/json",
-            "X-API-Key": api_key
+            "X-API-Key": io_sync_key or ""
         }
         
         req = urllib.request.Request(

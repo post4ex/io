@@ -162,8 +162,28 @@ def main():
     logging.info(f"Watching directory: {DATA_PATH}")
     logging.info(f"App Webhook endpoint: {TRIGGER_URL}")
     
+    io_sync_key = os.getenv("IO_SYNC_KEY")
+    if io_sync_key:
+        logging.info(f"IO_SYNC_KEY is loaded successfully (Prefix: {io_sync_key[:8]}).")
+    else:
+        logging.error("IO_SYNC_KEY is NOT configured in the environment! Sync webhooks will fail authentication.")
+        
     # Track file modification times
     last_mtimes = {}
+    
+    # Initial scan logging
+    try:
+        if os.path.exists(DATA_PATH):
+            files = [f for f in os.listdir(DATA_PATH) if f.endswith(".manager")]
+            logging.info(f"Initial directory scan found {len(files)} database files: {files}")
+            for f in files:
+                filepath = os.path.join(DATA_PATH, f)
+                mtime = os.path.getmtime(filepath)
+                logging.info(f"  - File '{f}': mtime={mtime}")
+        else:
+            logging.warning(f"Data path '{DATA_PATH}' does not exist on startup.")
+    except Exception as e:
+        logging.error(f"Error during initial directory scan: {e}")
     
     while True:
         try:

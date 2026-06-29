@@ -30,9 +30,13 @@ FINANCIAL_GUIDS = {
     "7662b887-c8d8-486e-98fd-f9dbcd41c6dc": "Payment / Receipt",
     "6c564f4c-380c-432e-af3b-2d6514c1891c": "Journal Entry",
     "b01b1a8a-36a1-4cef-b9aa-37ab14a4f51a": "Credit Note",
+    "245e5943-0092-409d-96ae-e2ee10eac75b": "Credit Note",     # Real Credit Note GUID
     "bf2a5d2a-b3dc-4898-a3d5-c9db3d66ce35": "Debit Note",
+    "274fc6d0-2eac-43d0-8286-79c856e644aa": "Debit Note",      # Real Debit Note GUID
     "4a8e8ade-9b4e-4d47-8e3b-5b4e2e6f6f8a": "Expense Claim",
+    "02572e0c-0167-4dbd-a392-08d8f67f3fe4": "Expense Claim",   # Real Expense Claim GUID
     "7ae97c09-de49-4f67-b4b5-d6bcbb8e6c62": "Payslip",
+    "1d103fa7-6fc1-4951-811e-972968b842cc": "Payslip",          # Real Payslip GUID
 }
 
 # In-memory checkpoints: { branch: last_processed_ticks }

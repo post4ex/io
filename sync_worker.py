@@ -13,35 +13,54 @@ logging.basicConfig(
 )
 
 # Configuration from Environment
-DATA_PATH = os.getenv("DATA_PATH", "/mnt/bucket/Managerio/Businesses")
-APP_URL = os.getenv("APP_URL", "https://post4ex-app.hf.space").rstrip("/")
-TRIGGER_URL = f"{APP_URL}/api/manager/sync/trigger"
+DATA_PATH     = os.getenv("DATA_PATH", "/mnt/bucket/Managerio/Businesses")
+APP_URL       = os.getenv("APP_URL", "https://post4ex-app.hf.space").rstrip("/")
+TRIGGER_URL   = f"{APP_URL}/api/manager/sync/trigger"
 SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", "1.5"))
 
-# In-memory checkpoints for each branch database: { branch_name: last_processed_ticks }
-checkpoints = {}
-checkpoint_dir = "/app"  # local container directory to persist checkpoints
+# ---------------------------------------------------------------------------
+# KNOWN FINANCIAL DOCUMENT GUIDs
+# These match GUID_TO_DOC_TYPE in the App's cache.py.
+# Only changes involving these GUIDs will trigger a webhook.
+# All other GUIDs (Users, Settings, Trash, etc.) are silently ignored.
+# ---------------------------------------------------------------------------
+FINANCIAL_GUIDS = {
+    "ad12b60b-23bf-4421-94df-8be79cef533e": "Sales Invoice",
+    "0dbdbf8a-d80c-48e6-b453-bb7862445b7c": "Purchase Invoice",
+    "7662b887-c8d8-486e-98fd-f9dbcd41c6dc": "Payment / Receipt",
+    "6c564f4c-380c-432e-af3b-2d6514c1891c": "Journal Entry",
+    "b01b1a8a-36a1-4cef-b9aa-37ab14a4f51a": "Credit Note",
+    "bf2a5d2a-b3dc-4898-a3d5-c9db3d66ce35": "Debit Note",
+    "4a8e8ade-9b4e-4d47-8e3b-5b4e2e6f6f8a": "Expense Claim",
+    "7ae97c09-de49-4f67-b4b5-d6bcbb8e6c62": "Payslip",
+}
+
+# In-memory checkpoints: { branch: last_processed_ticks }
+checkpoints   = {}
+checkpoint_dir = "/app"
+
 
 def ticks_to_datetime(ticks):
     try:
-        ticks = int(ticks)
-        unix_secs = (ticks - 621355968000000000) / 10000000.0
         from datetime import datetime, timezone
+        unix_secs = (int(ticks) - 621355968000000000) / 10000000.0
         return datetime.fromtimestamp(unix_secs, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     except Exception:
         return str(ticks)
+
 
 def load_checkpoint(branch):
     path = os.path.join(checkpoint_dir, f"checkpoint_{branch}.txt")
     if os.path.exists(path):
         try:
-            with open(path, "r") as f:
+            with open(path) as f:
                 val = int(f.read().strip())
-                logging.info(f"Loaded checkpoint for branch '{branch}': {ticks_to_datetime(val)}")
-                return val
+            logging.info(f"Loaded checkpoint for branch '{branch}': {ticks_to_datetime(val)}")
+            return val
         except Exception as e:
-            logging.error(f"Failed to load checkpoint file for {branch}: {e}")
+            logging.error(f"Failed to load checkpoint for '{branch}': {e}")
     return 0
+
 
 def save_checkpoint(branch, ticks):
     path = os.path.join(checkpoint_dir, f"checkpoint_{branch}.txt")
@@ -51,173 +70,181 @@ def save_checkpoint(branch, ticks):
             f.write(str(ticks))
         logging.info(f"Saved checkpoint for branch '{branch}': {ticks_to_datetime(ticks)}")
     except Exception as e:
-        logging.error(f"Failed to save checkpoint file for {branch}: {e}")
+        logging.error(f"Failed to save checkpoint for '{branch}': {e}")
+
+
+def extract_branch(filename):
+    """
+    Extract branch code from database filename.
+    Convention: {BRANCH}_BRANCH.manager  →  DDN_BRANCH.manager  →  DDN
+    Fallback: use stem of filename as branch.
+    """
+    stem = filename.replace(".manager", "")
+    if "_BRANCH" in stem:
+        return stem.split("_BRANCH")[0].upper()
+    return stem.upper()
+
 
 def check_database_changes(filename):
-    # Filename format: [BRANCH]_BRANCH.manager (e.g. DDN_BRANCH.manager)
-    # Extract branch code by splitting on underscore
-    branch = filename.split("_")[0].upper()
-    db_path = os.path.join(DATA_PATH, filename)
-    
-    io_sync_key = os.getenv("IO_SYNC_KEY")
-    if not io_sync_key:
-        logging.error("IO_SYNC_KEY is not configured in the environment. Webhook authentication will fail.")
+    branch   = extract_branch(filename)
+    db_path  = os.path.join(DATA_PATH, filename)
+    sync_key = os.getenv("IO_SYNC_KEY", "")
 
-    # Load last processed ticks
+    # Load checkpoint
     if branch not in checkpoints:
         checkpoints[branch] = load_checkpoint(branch)
-        
     last_ticks = checkpoints[branch]
-    
+
     conn = None
     try:
-        # Open database in read-only mode to prevent write conflicts
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         cursor = conn.cursor()
-        
-        # If this is the first run (checkpoint is 0), initialize checkpoint with the latest transaction timestamp
-        # to avoid syncing years of historical audit logs at startup.
+
+        # First run: initialize checkpoint to db tip — don't sync history
         if last_ticks == 0:
             cursor.execute("SELECT MAX(Timestamp) FROM Changes")
             max_val = cursor.fetchone()[0]
             last_ticks = max_val if max_val else 0
             checkpoints[branch] = last_ticks
             save_checkpoint(branch, last_ticks)
-            logging.info(f"Initialized checkpoint for branch '{branch}' to current database tip: {ticks_to_datetime(last_ticks)}")
+            logging.info(f"Initialized checkpoint for branch '{branch}' to current tip: {ticks_to_datetime(last_ticks)}")
             return
 
-        # Query all change records since the last checkpoint
+        # Fetch all new change records since checkpoint
         cursor.execute("""
-            SELECT Object, Timestamp, ContentTypeBefore, ContentTypeAfter 
-            FROM Changes 
-            WHERE Timestamp > ? 
+            SELECT Object, Timestamp, ContentTypeBefore, ContentTypeAfter
+            FROM Changes
+            WHERE Timestamp > ?
             ORDER BY Timestamp ASC
         """, (last_ticks,))
-        
         rows = cursor.fetchall()
+
         if not rows:
             return
-            
-        logging.info(f"Found {len(rows)} new changes in database '{filename}'")
-        
-        # Package changes
-        changes = []
+
+        logging.info(f"Found {len(rows)} new change(s) in '{filename}' — filtering for financial documents...")
+
+        changes      = []
         highest_ticks = last_ticks
-        
+
         for obj, ts, ct_before, ct_after in rows:
             highest_ticks = max(highest_ticks, ts)
-            
-            # Deletion signature
-            if ct_after == '00000000-0000-0000-0000-000000000000':
-                changes.append({
-                    "action": "delete",
-                    "key": obj,
-                    "type": ct_before
-                })
-            else:
-                changes.append({
-                    "action": "upsert",
-                    "key": obj,
-                    "type": ct_after
-                })
-                
-        # Send Webhook to App Space
-        payload = {
-            "branch": branch.lower(),
-            "changes": changes
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "X-API-Key": io_sync_key or ""
-        }
-        
+
+            is_delete = (ct_after == "00000000-0000-0000-0000-000000000000")
+            relevant_guid = ct_before if is_delete else ct_after
+
+            if relevant_guid not in FINANCIAL_GUIDS:
+                logging.info(f"  - Skipping non-financial change: GUID={relevant_guid} key={obj}")
+                continue
+
+            action = "delete" if is_delete else "upsert"
+            doc_label = FINANCIAL_GUIDS[relevant_guid]
+            logging.info(f"  - Detected {action.upper()}: {doc_label} | key={obj}")
+            changes.append({
+                "action": action,
+                "key":    obj,
+                "type":   relevant_guid
+            })
+
+        # Always advance checkpoint so we don't re-read the same rows
+        checkpoints[branch] = highest_ticks
+        save_checkpoint(branch, highest_ticks)
+
+        if not changes:
+            logging.info(f"  - No financial document changes. Checkpoint advanced. No webhook sent.")
+            return
+
+        # Send webhook to App — just the detections, the App workers do the rest
+        payload = {"branch": branch.lower(), "changes": changes}
         req = urllib.request.Request(
             TRIGGER_URL,
-            data=json.dumps(payload).encode('utf-8'),
-            headers=headers,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key":    sync_key
+            },
             method="POST"
         )
-        
-        logging.info(f"Sending webhook to App for branch '{branch}' with {len(changes)} changes...")
+
+        logging.info(f"Sending webhook to App for branch '{branch}' with {len(changes)} financial change(s)...")
         with urllib.request.urlopen(req, timeout=10) as response:
-            status = response.getcode()
-            if status == 200:
-                logging.info(f"App successfully processed trigger for branch '{branch}'")
-                # Update checkpoint
-                checkpoints[branch] = highest_ticks
-                save_checkpoint(branch, highest_ticks)
+            if response.getcode() == 200:
+                logging.info(f"App acknowledged trigger for branch '{branch}'")
             else:
-                logging.error(f"App returned unexpected status {status} for branch '{branch}'")
-                
+                logging.error(f"App returned unexpected status {response.getcode()}")
+
     except urllib.error.HTTPError as he:
-        logging.error(f"App returned error status {he.code} for branch '{branch}': {he.read().decode('utf-8', errors='ignore')}")
+        body = he.read().decode("utf-8", errors="ignore")
+        logging.error(f"App returned HTTP {he.code} for branch '{branch}': {body}")
     except Exception as e:
-        logging.error(f"Error checking changes in database '{filename}': {e}")
+        logging.error(f"Error processing '{filename}': {e}")
     finally:
         if conn:
             conn.close()
 
+
 def main():
-    logging.info(f"Starting Manager.io Real-Time Watcher Daemon...")
+    logging.info("Starting Manager.io Real-Time Watcher Daemon...")
     logging.info(f"Watching directory: {DATA_PATH}")
     logging.info(f"App Webhook endpoint: {TRIGGER_URL}")
-    
-    io_sync_key = os.getenv("IO_SYNC_KEY")
-    if io_sync_key:
-        logging.info(f"IO_SYNC_KEY is loaded successfully (Prefix: {io_sync_key[:8]}).")
+
+    sync_key = os.getenv("IO_SYNC_KEY")
+    if sync_key:
+        logging.info(f"IO_SYNC_KEY loaded (Prefix: {sync_key[:8]}).")
     else:
-        logging.error("IO_SYNC_KEY is NOT configured in the environment! Sync webhooks will fail authentication.")
-        
-    # Track file modification times
+        logging.error("IO_SYNC_KEY is NOT set! Webhooks will fail authentication.")
+
     last_mtimes = {}
-    
-    # Initial scan of the watch directory
+
+    # Initial directory scan
     try:
         if os.path.exists(DATA_PATH):
             files = [f for f in os.listdir(DATA_PATH) if f.endswith(".manager")]
-            logging.info(f"Initial scan found {len(files)} active database files in watch directory: {files}")
+            logging.info(f"Found {len(files)} database file(s): {files}")
             for f in files:
-                filepath = os.path.join(DATA_PATH, f)
-                mtime = os.path.getmtime(filepath)
-                logging.info(f"  - Monitoring '{f}' (mtime={mtime})")
+                fp = os.path.join(DATA_PATH, f)
+                mtime = os.path.getmtime(fp)
+                branch = extract_branch(f)
+                logging.info(f"  - Monitoring '{f}' as branch '{branch}' (mtime={mtime})")
         else:
             logging.warning(f"Data path '{DATA_PATH}' does not exist on startup.")
     except Exception as e:
-        logging.error(f"Error during initial directory scan: {e}")
-    
+        logging.error(f"Error during initial scan: {e}")
+
+    # Main watch loop
     while True:
         try:
             if not os.path.exists(DATA_PATH):
-                logging.warning(f"Data path '{DATA_PATH}' does not exist yet. Waiting...")
+                logging.warning(f"Data path '{DATA_PATH}' missing. Waiting...")
                 time.sleep(5)
                 continue
-                
+
             for filename in os.listdir(DATA_PATH):
-                if filename.endswith(".manager"):
-                    filepath = os.path.join(DATA_PATH, filename)
-                    try:
-                        mtime = os.path.getmtime(filepath)
-                    except OSError:
-                        continue # File might be locked/inaccessible temporarily
-                        
-                    if filename not in last_mtimes:
-                        # Initial discovery: record modification time
-                        last_mtimes[filename] = mtime
-                        # Make sure checkpoints are initialized
-                        branch = filename.split("_")[0].upper()
-                        if branch not in checkpoints:
-                            checkpoints[branch] = load_checkpoint(branch)
-                    elif mtime > last_mtimes[filename]:
-                        # File modified! Wait briefly for writes to complete and lock to release
-                        time.sleep(0.5)
-                        logging.info(f"Database file '{filename}' was modified. Checking for changes...")
-                        check_database_changes(filename)
-                        last_mtimes[filename] = os.path.getmtime(filepath) # update to latest mtime after check
-                        
+                if not filename.endswith(".manager"):
+                    continue
+
+                filepath = os.path.join(DATA_PATH, filename)
+                try:
+                    mtime = os.path.getmtime(filepath)
+                except OSError:
+                    continue
+
+                if filename not in last_mtimes:
+                    last_mtimes[filename] = mtime
+                    branch = extract_branch(filename)
+                    if branch not in checkpoints:
+                        checkpoints[branch] = load_checkpoint(branch)
+                elif mtime > last_mtimes[filename]:
+                    time.sleep(0.5)  # brief wait for write to complete
+                    logging.info(f"Database '{filename}' modified. Checking for changes...")
+                    check_database_changes(filename)
+                    last_mtimes[filename] = os.path.getmtime(filepath)
+
         except Exception as e:
-            logging.error(f"Fatal error in main watch loop: {e}")
-            
+            logging.error(f"Fatal error in watch loop: {e}")
+
         time.sleep(SCAN_INTERVAL)
+
 
 if __name__ == "__main__":
     main()

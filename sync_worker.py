@@ -2,6 +2,7 @@ import os
 import time
 import sqlite3
 import urllib.request
+import urllib.parse
 import json
 import logging
 
@@ -218,7 +219,7 @@ def sync_databases_on_startup():
         sb_files = []
         for f in files_metadata:
             name = f.get("name")
-            if not name or name == "test.txt":
+            if not name or name == "test.txt" or f.get("id") is None:
                 continue
             # Remove leading 'io-backup/' prefix if present in the returned name
             if name.startswith("io-backup/"):

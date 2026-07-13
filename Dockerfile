@@ -40,6 +40,11 @@ fi
 rm -f "$DATA_PATH/.write_test"
 
 echo "Manager.io data path: $DATA_PATH"
+
+# Synchronize database files before starting ManagerServer
+echo "Restoring databases from Supabase..."
+python3 /app/sync_worker.py --restore-only
+
 echo "Starting Manager.io on port $RUN_PORT..."
 
 cd /app

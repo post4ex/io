@@ -349,9 +349,6 @@ def main():
     logging.info(f"Watching directory: {DATA_PATH}")
     logging.info(f"App Webhook endpoint: {TRIGGER_URL}")
 
-    # Synchronize database files on startup (migration or restore)
-    sync_databases_on_startup()
-
     sync_key = os.getenv("IO_SYNC_KEY")
     if sync_key:
         logging.info(f"IO_SYNC_KEY loaded (Prefix: {sync_key[:8]}).")
@@ -419,4 +416,8 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--restore-only":
+        sync_databases_on_startup()
+        sys.exit(0)
     main()

@@ -259,7 +259,7 @@ def sync_databases_on_startup():
                     logging.info(f"Uploaded '{rel_path}': {resp_up.read().decode()}")
             logging.info("Migration to Supabase completed.")
             
-        # Scenario B: Supabase has files -> Restore Supabase files locally
+        # Scenario B: Supabase has files -> Restore Supabase files locally, and upload any local files not in Supabase
         elif sb_files:
             logging.info("Found database files in Supabase. Restoring them locally...")
             for rel_path in sb_files:
@@ -279,6 +279,30 @@ def sync_databases_on_startup():
                     f.write(file_content)
                 logging.info(f"Restored '{rel_path}' locally.")
             logging.info("Database restore from Supabase completed.")
+
+            # Check if there are local files that are NOT in Supabase and upload them
+            for rel_path in local_files:
+                if rel_path not in sb_files:
+                    logging.info(f"Local file '{rel_path}' is missing in Supabase. Uploading...")
+                    filepath = os.path.join(ROOT_DIR, rel_path)
+                    try:
+                        with open(filepath, "rb") as f:
+                            file_content = f.read()
+                        upload_url = f"{supabase_url}/storage/v1/object/Backups/io-backup/{rel_path}"
+                        req_up = urllib.request.Request(
+                            upload_url,
+                            data=file_content,
+                            headers={
+                                "Authorization": f"Bearer {supabase_key}",
+                                "Content-Type": "application/octet-stream",
+                                "x-upsert": "true"
+                            },
+                            method="POST"
+                        )
+                        with urllib.request.urlopen(req_up, timeout=120) as resp_up:
+                            logging.info(f"Uploaded missing file '{rel_path}': {resp_up.read().decode()}")
+                    except Exception as e:
+                        logging.error(f"Failed to upload missing file '{rel_path}': {e}")
             
         else:
             logging.info("No files found either locally or in Supabase.")

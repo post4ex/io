@@ -189,8 +189,8 @@ def check_database_changes(filename):
 
 def sync_databases_on_startup():
     logging.info("Syncing databases on startup...")
-    supabase_url = "https://jxcvtcjuuvrltzjajwcm.supabase.co"
-    supabase_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp4Y3Z0Y2p1dXZybHR6amFqd2NtIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MDcyMzIzNCwiZXhwIjoyMDk2Mjk5MjM0fQ.zeGjz2rrYBrB_bmXO4zY4RW8fnsWiec9BvSuXOlTdqQ"
+    supabase_url = os.getenv("SUPABASE_URL", "https://jxcvtcjuuvrltzjajwcm.supabase.co")
+    supabase_key = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp4Y3Z0Y2p1dXZybHR6amFqd2NtIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MDcyMzIzNCwiZXhwIjoyMDk2Mjk5MjM0fQ.zeGjz2rrYBrB_bmXO4zY4RW8fnsWiec9BvSuXOlTdqQ")
     
     os.makedirs(DATA_PATH, exist_ok=True)
     
@@ -268,8 +268,8 @@ def sync_databases_on_startup():
 
 def backup_to_supabase():
     logging.info("Running periodic backup of database files to Supabase...")
-    supabase_url = "https://jxcvtcjuuvrltzjajwcm.supabase.co"
-    supabase_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp4Y3Z0Y2p1dXZybHR6amFqd2NtIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MDcyMzIzNCwiZXhwIjoyMDk2Mjk5MjM0fQ.zeGjz2rrYBrB_bmXO4zY4RW8fnsWiec9BvSuXOlTdqQ"
+    supabase_url = os.getenv("SUPABASE_URL", "https://jxcvtcjuuvrltzjajwcm.supabase.co")
+    supabase_key = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp4Y3Z0Y2p1dXZybHR6amFqd2NtIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MDcyMzIzNCwiZXhwIjoyMDk2Mjk5MjM0fQ.zeGjz2rrYBrB_bmXO4zY4RW8fnsWiec9BvSuXOlTdqQ")
     
     if not os.path.exists(DATA_PATH):
         logging.warning(f"DATA_PATH '{DATA_PATH}' does not exist. Skipping backup.")

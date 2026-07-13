@@ -187,10 +187,124 @@ def check_database_changes(filename):
             conn.close()
 
 
+def sync_databases_on_startup():
+    logging.info("Syncing databases on startup...")
+    supabase_url = "https://jxcvtcjuuvrltzjajwcm.supabase.co"
+    supabase_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp4Y3Z0Y2p1dXZybHR6amFqd2NtIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MDcyMzIzNCwiZXhwIjoyMDk2Mjk5MjM0fQ.zeGjz2rrYBrB_bmXO4zY4RW8fnsWiec9BvSuXOlTdqQ"
+    
+    os.makedirs(DATA_PATH, exist_ok=True)
+    
+    try:
+        # 1. List files in Supabase bucket under io-backup/
+        list_url = f"{supabase_url}/storage/v1/object/list/Backups"
+        req = urllib.request.Request(
+            list_url,
+            data=json.dumps({"prefix": "io-backup"}).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            files_metadata = json.loads(resp.read().decode())
+            
+        sb_files = [f.get("name") for f in files_metadata if f.get("name") and f.get("name") != "test.txt"]
+        
+        logging.info(f"Supabase storage files: {sb_files}")
+        
+        # 2. Check local files
+        local_files = [f for f in os.listdir(DATA_PATH) if f.endswith(".manager")]
+        logging.info(f"Local database files: {local_files}")
+        
+        # Scenario A: Supabase has no files, but local has files -> Migrate local to Supabase
+        if not sb_files and local_files:
+            logging.info("Supabase storage is empty. Starting migration of local files to Supabase...")
+            for filename in local_files:
+                filepath = os.path.join(DATA_PATH, filename)
+                logging.info(f"Uploading '{filename}' to Supabase...")
+                with open(filepath, "rb") as f:
+                    file_content = f.read()
+                upload_url = f"{supabase_url}/storage/v1/object/Backups/io-backup/{filename}"
+                req_up = urllib.request.Request(
+                    upload_url,
+                    data=file_content,
+                    headers={
+                        "Authorization": f"Bearer {supabase_key}",
+                        "Content-Type": "application/octet-stream",
+                        "x-upsert": "true"
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(req_up, timeout=120) as resp_up:
+                    logging.info(f"Uploaded '{filename}': {resp_up.read().decode()}")
+            logging.info("Migration to Supabase completed.")
+            
+        # Scenario B: Supabase has files -> Restore Supabase files locally
+        elif sb_files:
+            logging.info("Found database files in Supabase. Restoring them locally...")
+            for filename in sb_files:
+                local_filepath = os.path.join(DATA_PATH, filename)
+                download_url = f"{supabase_url}/storage/v1/object/Backups/io-backup/{filename}"
+                logging.info(f"Downloading '{filename}' from Supabase...")
+                req_dl = urllib.request.Request(
+                    download_url,
+                    headers={"Authorization": f"Bearer {supabase_key}"},
+                    method="GET"
+                )
+                with urllib.request.urlopen(req_dl, timeout=120) as resp_dl:
+                    file_content = resp_dl.read()
+                with open(local_filepath, "wb") as f:
+                    f.write(file_content)
+                logging.info(f"Restored '{filename}' locally.")
+            logging.info("Database restore from Supabase completed.")
+            
+        else:
+            logging.info("No database files found either locally or in Supabase.")
+            
+    except Exception as e:
+        logging.error(f"Error during startup sync: {e}")
+
+
+def backup_to_supabase():
+    logging.info("Running periodic backup of database files to Supabase...")
+    supabase_url = "https://jxcvtcjuuvrltzjajwcm.supabase.co"
+    supabase_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp4Y3Z0Y2p1dXZybHR6amFqd2NtIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MDcyMzIzNCwiZXhwIjoyMDk2Mjk5MjM0fQ.zeGjz2rrYBrB_bmXO4zY4RW8fnsWiec9BvSuXOlTdqQ"
+    
+    if not os.path.exists(DATA_PATH):
+        logging.warning(f"DATA_PATH '{DATA_PATH}' does not exist. Skipping backup.")
+        return
+        
+    files = [f for f in os.listdir(DATA_PATH) if f.endswith(".manager")]
+    for filename in files:
+        filepath = os.path.join(DATA_PATH, filename)
+        try:
+            with open(filepath, "rb") as f:
+                file_content = f.read()
+            upload_url = f"{supabase_url}/storage/v1/object/Backups/io-backup/{filename}"
+            req = urllib.request.Request(
+                upload_url,
+                data=file_content,
+                headers={
+                    "Authorization": f"Bearer {supabase_key}",
+                    "Content-Type": "application/octet-stream",
+                    "x-upsert": "true"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                logging.info(f"Successfully backed up '{filename}': {resp.read().decode()}")
+        except Exception as e:
+            logging.error(f"Failed to backup '{filename}': {e}")
+
+
 def main():
     logging.info("Starting Manager.io Real-Time Watcher Daemon...")
     logging.info(f"Watching directory: {DATA_PATH}")
     logging.info(f"App Webhook endpoint: {TRIGGER_URL}")
+
+    # Synchronize database files on startup (migration or restore)
+    sync_databases_on_startup()
 
     sync_key = os.getenv("IO_SYNC_KEY")
     if sync_key:
@@ -214,6 +328,8 @@ def main():
             logging.warning(f"Data path '{DATA_PATH}' does not exist on startup.")
     except Exception as e:
         logging.error(f"Error during initial scan: {e}")
+
+    last_backup_time = time.time()
 
     # Main watch loop
     while True:
@@ -243,6 +359,12 @@ def main():
                     logging.info(f"Database '{filename}' modified. Checking for changes...")
                     check_database_changes(filename)
                     last_mtimes[filename] = os.path.getmtime(filepath)
+
+            # Perform periodic backup every 5 minutes (300 seconds)
+            current_time = time.time()
+            if current_time - last_backup_time >= 300:
+                backup_to_supabase()
+                last_backup_time = current_time
 
         except Exception as e:
             logging.error(f"Fatal error in watch loop: {e}")

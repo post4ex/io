@@ -14,6 +14,7 @@ logging.basicConfig(
 
 # Configuration from Environment
 DATA_PATH     = os.getenv("DATA_PATH", "/mnt/bucket/Managerio/Businesses")
+ROOT_DIR      = os.path.dirname(DATA_PATH)
 APP_URL       = os.getenv("APP_URL", "https://post4ex-app.hf.space").rstrip("/")
 TRIGGER_URL   = f"{APP_URL}/api/manager/sync/trigger"
 SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", "1.5"))
@@ -192,14 +193,19 @@ def sync_databases_on_startup():
     supabase_url = os.getenv("SUPABASE_URL", "https://jxcvtcjuuvrltzjajwcm.supabase.co")
     supabase_key = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp4Y3Z0Y2p1dXZybHR6amFqd2NtIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MDcyMzIzNCwiZXhwIjoyMDk2Mjk5MjM0fQ.zeGjz2rrYBrB_bmXO4zY4RW8fnsWiec9BvSuXOlTdqQ")
     
-    os.makedirs(DATA_PATH, exist_ok=True)
+    os.makedirs(ROOT_DIR, exist_ok=True)
     
     try:
-        # 1. List files in Supabase bucket under io-backup/
+        # 1. List files recursively in Supabase bucket under io-backup/
         list_url = f"{supabase_url}/storage/v1/object/list/Backups"
         req = urllib.request.Request(
             list_url,
-            data=json.dumps({"prefix": "io-backup"}).encode("utf-8"),
+            data=json.dumps({
+                "prefix": "io-backup",
+                "options": {
+                    "recursive": True
+                }
+            }).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {supabase_key}",
                 "Content-Type": "application/json"
@@ -209,23 +215,36 @@ def sync_databases_on_startup():
         with urllib.request.urlopen(req, timeout=30) as resp:
             files_metadata = json.loads(resp.read().decode())
             
-        sb_files = [f.get("name") for f in files_metadata if f.get("name") and f.get("name") != "test.txt"]
+        sb_files = []
+        for f in files_metadata:
+            name = f.get("name")
+            if not name or name == "test.txt":
+                continue
+            # Remove leading 'io-backup/' prefix if present in the returned name
+            if name.startswith("io-backup/"):
+                name = name[len("io-backup/"):]
+            sb_files.append(name)
+            
+        logging.info(f"Supabase storage files found: {sb_files}")
         
-        logging.info(f"Supabase storage files: {sb_files}")
+        # 2. Check local files recursively
+        local_files = []
+        for root, dirs, files in os.walk(ROOT_DIR):
+            for file in files:
+                filepath = os.path.join(root, file)
+                rel_path = os.path.relpath(filepath, ROOT_DIR)
+                local_files.append(rel_path)
+        logging.info(f"Local files found: {local_files}")
         
-        # 2. Check local files
-        local_files = [f for f in os.listdir(DATA_PATH) if f.endswith(".manager")]
-        logging.info(f"Local database files: {local_files}")
-        
-        # Scenario A: Supabase has no files, but local has files -> Migrate local to Supabase
+        # Scenario A: Supabase has no files, but local has files -> Migrate all local files to Supabase
         if not sb_files and local_files:
-            logging.info("Supabase storage is empty. Starting migration of local files to Supabase...")
-            for filename in local_files:
-                filepath = os.path.join(DATA_PATH, filename)
-                logging.info(f"Uploading '{filename}' to Supabase...")
+            logging.info("Supabase storage is empty. Starting migration of all local files to Supabase...")
+            for rel_path in local_files:
+                filepath = os.path.join(ROOT_DIR, rel_path)
+                logging.info(f"Uploading '{rel_path}' to Supabase...")
                 with open(filepath, "rb") as f:
                     file_content = f.read()
-                upload_url = f"{supabase_url}/storage/v1/object/Backups/io-backup/{filename}"
+                upload_url = f"{supabase_url}/storage/v1/object/Backups/io-backup/{rel_path}"
                 req_up = urllib.request.Request(
                     upload_url,
                     data=file_content,
@@ -237,16 +256,18 @@ def sync_databases_on_startup():
                     method="POST"
                 )
                 with urllib.request.urlopen(req_up, timeout=120) as resp_up:
-                    logging.info(f"Uploaded '{filename}': {resp_up.read().decode()}")
+                    logging.info(f"Uploaded '{rel_path}': {resp_up.read().decode()}")
             logging.info("Migration to Supabase completed.")
             
         # Scenario B: Supabase has files -> Restore Supabase files locally
         elif sb_files:
             logging.info("Found database files in Supabase. Restoring them locally...")
-            for filename in sb_files:
-                local_filepath = os.path.join(DATA_PATH, filename)
-                download_url = f"{supabase_url}/storage/v1/object/Backups/io-backup/{filename}"
-                logging.info(f"Downloading '{filename}' from Supabase...")
+            for rel_path in sb_files:
+                local_filepath = os.path.join(ROOT_DIR, rel_path)
+                os.makedirs(os.path.dirname(local_filepath), exist_ok=True)
+                
+                download_url = f"{supabase_url}/storage/v1/object/Backups/io-backup/{rel_path}"
+                logging.info(f"Downloading '{rel_path}' from Supabase...")
                 req_dl = urllib.request.Request(
                     download_url,
                     headers={"Authorization": f"Bearer {supabase_key}"},
@@ -256,46 +277,47 @@ def sync_databases_on_startup():
                     file_content = resp_dl.read()
                 with open(local_filepath, "wb") as f:
                     f.write(file_content)
-                logging.info(f"Restored '{filename}' locally.")
+                logging.info(f"Restored '{rel_path}' locally.")
             logging.info("Database restore from Supabase completed.")
             
         else:
-            logging.info("No database files found either locally or in Supabase.")
+            logging.info("No files found either locally or in Supabase.")
             
     except Exception as e:
         logging.error(f"Error during startup sync: {e}")
 
 
 def backup_to_supabase():
-    logging.info("Running periodic backup of database files to Supabase...")
+    logging.info("Running periodic backup of all database files to Supabase...")
     supabase_url = os.getenv("SUPABASE_URL", "https://jxcvtcjuuvrltzjajwcm.supabase.co")
     supabase_key = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp4Y3Z0Y2p1dXZybHR6amFqd2NtIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MDcyMzIzNCwiZXhwIjoyMDk2Mjk5MjM0fQ.zeGjz2rrYBrB_bmXO4zY4RW8fnsWiec9BvSuXOlTdqQ")
     
-    if not os.path.exists(DATA_PATH):
-        logging.warning(f"DATA_PATH '{DATA_PATH}' does not exist. Skipping backup.")
+    if not os.path.exists(ROOT_DIR):
+        logging.warning(f"ROOT_DIR '{ROOT_DIR}' does not exist. Skipping backup.")
         return
         
-    files = [f for f in os.listdir(DATA_PATH) if f.endswith(".manager")]
-    for filename in files:
-        filepath = os.path.join(DATA_PATH, filename)
-        try:
-            with open(filepath, "rb") as f:
-                file_content = f.read()
-            upload_url = f"{supabase_url}/storage/v1/object/Backups/io-backup/{filename}"
-            req = urllib.request.Request(
-                upload_url,
-                data=file_content,
-                headers={
-                    "Authorization": f"Bearer {supabase_key}",
-                    "Content-Type": "application/octet-stream",
-                    "x-upsert": "true"
-                },
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                logging.info(f"Successfully backed up '{filename}': {resp.read().decode()}")
-        except Exception as e:
-            logging.error(f"Failed to backup '{filename}': {e}")
+    for root, dirs, files in os.walk(ROOT_DIR):
+        for file in files:
+            filepath = os.path.join(root, file)
+            rel_path = os.path.relpath(filepath, ROOT_DIR)
+            try:
+                with open(filepath, "rb") as f:
+                    file_content = f.read()
+                upload_url = f"{supabase_url}/storage/v1/object/Backups/io-backup/{rel_path}"
+                req = urllib.request.Request(
+                    upload_url,
+                    data=file_content,
+                    headers={
+                        "Authorization": f"Bearer {supabase_key}",
+                        "Content-Type": "application/octet-stream",
+                        "x-upsert": "true"
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    logging.info(f"Successfully backed up '{rel_path}': {resp.read().decode()}")
+            except Exception as e:
+                logging.error(f"Failed to backup '{rel_path}': {e}")
 
 
 def main():

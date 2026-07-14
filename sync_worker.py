@@ -21,7 +21,7 @@ ROOT_DIR      = os.path.dirname(DATA_PATH)
 APP_URL       = os.getenv("APP_URL", "https://post4ex-app.hf.space").rstrip("/")
 TRIGGER_URL   = f"{APP_URL}/api/manager/sync/trigger"
 SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", "1.5"))
-DB_PATH       = "/app/cache.db"
+DB_PATH       = os.getenv("DB_PATH", "/app/cache.db")
 
 # ---------------------------------------------------------------------------
 # SUPABASE UTILITIES
@@ -194,7 +194,7 @@ TXN_TYPE_MAP = {
 }
 
 checkpoints = {}
-checkpoint_dir = "/app"
+checkpoint_dir = os.getenv("CHECKPOINT_DIR", "/app")
 
 # ---------------------------------------------------------------------------
 # DATE & TIME CONVERSION HELPERS

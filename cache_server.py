@@ -9,7 +9,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [CacheServer] %(message)s")
 
 PORT = 8000
-DB_PATH = "/app/cache.db"
+DB_PATH = os.getenv("DB_PATH", "/app/cache.db")
 
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH)

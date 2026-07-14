@@ -18,12 +18,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
     def log_message(self, format, *args):
-        # Suppress standard logging to prevent log pollution, only log proxy destinations
+        # Suppress standard logging to prevent log pollution
         pass
 
-    def do_proxy(self):
+    def _do_proxy_impl(self):
         path = self.path
-        # Route requests starting with /api/io/ to the Python Cache Server
         if path.startswith("/api/io/") or path == "/ping" or path == "/api/io/ping":
             target_base = CACHE_SERVER_URL
         else:
@@ -31,14 +30,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         target_url = f"{target_base}{path}"
         
-        # Read request body if present
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length) if content_length > 0 else None
 
-        # Copy incoming headers
         headers = {}
         for k, v in self.headers.items():
-            # Skip connection headers to let urllib/http client handle them
             if k.lower() not in ('host', 'connection', 'content-length'):
                 headers[k] = v
 
@@ -52,7 +48,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             with urllib.request.urlopen(req, timeout=30) as response:
                 self.send_response(response.status)
-                # Forward response headers
                 for k, v in response.getheaders():
                     if k.lower() not in ('transfer-encoding', 'connection', 'content-length'):
                         self.send_header(k, v)
@@ -62,19 +57,35 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(resp_body)
         except urllib.error.HTTPError as e:
-            self.send_response(e.code)
-            for k, v in e.headers.items():
-                if k.lower() not in ('transfer-encoding', 'connection', 'content-length'):
-                    self.send_header(k, v)
-            resp_body = e.read()
-            self.send_header('Content-Length', str(len(resp_body)))
-            self.end_headers()
-            self.wfile.write(resp_body)
+            try:
+                self.send_response(e.code)
+                for k, v in e.headers.items():
+                    if k.lower() not in ('transfer-encoding', 'connection', 'content-length'):
+                        self.send_header(k, v)
+                resp_body = e.read()
+                self.send_header('Content-Length', str(len(resp_body)))
+                self.end_headers()
+                self.wfile.write(resp_body)
+            except Exception:
+                pass
         except Exception as e:
-            logging.error(f"Error proxying {self.command} {path} to {target_url}: {e}")
-            self.send_response(502)
-            self.end_headers()
-            self.wfile.write(f"Bad Gateway: {e}".encode('utf-8'))
+            # Only log errors that are not connection reset/broken pipe by client
+            if not isinstance(e, (ConnectionResetError, BrokenPipeError)):
+                logging.error(f"Error proxying {self.command} {path} to {target_url}: {e}")
+            try:
+                self.send_response(502)
+                self.end_headers()
+                self.wfile.write(f"Bad Gateway: {e}".encode('utf-8'))
+            except Exception:
+                pass
+
+    def do_proxy(self):
+        try:
+            self._do_proxy_impl()
+        except (ConnectionResetError, BrokenPipeError):
+            pass # Silent ignore on client abort
+        except Exception as e:
+            logging.error(f"Unhandled proxy handler exception: {e}")
 
     def do_GET(self):
         self.do_proxy()

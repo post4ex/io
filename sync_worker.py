@@ -14,8 +14,8 @@ logging.basicConfig(
 )
 
 # Configuration from Environment
-DATA_PATH     = os.getenv("DATA_PATH", "/mnt/bucket/Managerio/Businesses")
-ROOT_DIR      = os.path.dirname(DATA_PATH)
+DATA_PATH     = os.getenv("DATA_PATH", "/mnt/bucket/Managerio")
+ROOT_DIR      = DATA_PATH
 APP_URL       = os.getenv("APP_URL", "https://post4ex-app.hf.space").rstrip("/")
 TRIGGER_URL   = f"{APP_URL}/api/manager/sync/trigger"
 SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", "1.5"))

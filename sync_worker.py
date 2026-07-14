@@ -410,9 +410,18 @@ def sync_casheio_for_branch(branch):
             """, (item["id"], item["BRANCH"], item["CATEGORY"], item["IDENTIFIER"], item["KEY_VAL"], item["METADATA"], item["TIME_STAMP"]))
         conn.commit()
 
-        # Write to Supabase CASHEIO table in bulk
+        # Write to Supabase CASHEIO table in bulk (parsing METADATA back to real dict for JSONB compatibility)
         if items_to_upsert:
-            sb_req("POST", "CASHEIO", {"on_conflict": "id"}, items_to_upsert, prefer="resolution=merge-duplicates")
+            sb_items = []
+            for item in items_to_upsert:
+                sb_item = item.copy()
+                if sb_item["METADATA"]:
+                    try:
+                        sb_item["METADATA"] = json.loads(sb_item["METADATA"])
+                    except Exception:
+                        pass
+                sb_items.append(sb_item)
+            sb_req("POST", "CASHEIO", {"on_conflict": "id"}, sb_items, prefer="resolution=merge-duplicates")
 
         logging.info(f"Casheio key cache updated for branch '{branch}': {len(items_to_upsert)} entries.")
     except Exception as e:
@@ -563,7 +572,17 @@ def sync_headers_for_branch(branch):
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (ref["id"], ref["BRANCH"], ref["CATEGORY"], ref["IDENTIFIER"], ref["KEY_VAL"], ref["METADATA"], ref["TIME_STAMP"]))
         conn.commit()
-        sb_req("POST", "CASHEIO", {"on_conflict": "id"}, references_to_upsert, prefer="resolution=merge-duplicates")
+        
+        sb_references = []
+        for ref in references_to_upsert:
+            sb_ref = ref.copy()
+            if sb_ref["METADATA"]:
+                try:
+                    sb_ref["METADATA"] = json.loads(sb_ref["METADATA"])
+                except Exception:
+                    pass
+            sb_references.append(sb_ref)
+        sb_req("POST", "CASHEIO", {"on_conflict": "id"}, sb_references, prefer="resolution=merge-duplicates")
 
     # Reconcile Orphans (deleted documents)
     cursor.execute("SELECT DOX_KEY, DOX_TYPE FROM HEADER WHERE BRANCH = ?", (branch.upper(),))
@@ -747,8 +766,14 @@ def sync_ledger_for_branch(branch):
                 ))
             conn.commit()
 
-            # Insert batch in Supabase
-            sb_req("POST", "LEDGER", None, ledger_batch, prefer="resolution=merge-duplicates")
+            # Insert batch in Supabase (excluding auto-generated database columns TXN_ID and id)
+            sb_ledger_batch = []
+            for row in ledger_batch:
+                sb_row = row.copy()
+                sb_row.pop("TXN_ID", None)
+                sb_row.pop("id", None)
+                sb_ledger_batch.append(sb_row)
+            sb_req("POST", "LEDGER", None, sb_ledger_batch, prefer="resolution=merge-duplicates")
 
         if len(txns) < page_size:
             break

@@ -402,6 +402,12 @@ def sync_casheio_for_branch(branch):
             except Exception:
                 pass
 
+        # De-duplicate by id to avoid ON CONFLICT DO UPDATE cardinality violation on duplicate keys in bulk insert
+        dedup_map = {}
+        for item in items_to_upsert:
+            dedup_map[item["id"]] = item
+        items_to_upsert = list(dedup_map.values())
+
         # Write to local SQLite CASHEIO table
         for item in items_to_upsert:
             cursor.execute("""
@@ -566,6 +572,11 @@ def sync_headers_for_branch(branch):
 
     # Perform bulk SQLite & Supabase Reference writes
     if references_to_upsert:
+        dedup_ref = {}
+        for ref in references_to_upsert:
+            dedup_ref[ref["id"]] = ref
+        references_to_upsert = list(dedup_ref.values())
+
         for ref in references_to_upsert:
             cursor.execute("""
             INSERT OR REPLACE INTO CASHEIO (id, BRANCH, CATEGORY, IDENTIFIER, KEY_VAL, METADATA, TIME_STAMP)

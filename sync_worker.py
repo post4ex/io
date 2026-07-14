@@ -410,9 +410,9 @@ def sync_casheio_for_branch(branch):
             """, (item["id"], item["BRANCH"], item["CATEGORY"], item["IDENTIFIER"], item["KEY_VAL"], item["METADATA"], item["TIME_STAMP"]))
         conn.commit()
 
-        # Write to Supabase CASHEIO table
-        for item in items_to_upsert:
-            sb_req("POST", "CASHEIO", {"on_conflict": "id"}, item)
+        # Write to Supabase CASHEIO table in bulk
+        if items_to_upsert:
+            sb_req("POST", "CASHEIO", {"on_conflict": "id"}, items_to_upsert, prefer="resolution=merge-duplicates")
 
         logging.info(f"Casheio key cache updated for branch '{branch}': {len(items_to_upsert)} entries.")
     except Exception as e:
@@ -437,6 +437,9 @@ def sync_headers_for_branch(branch):
     cursor = conn.cursor()
 
     active_keys = set()
+
+    headers_to_upsert = []
+    references_to_upsert = []
 
     for dox_type, meta in _DOC_META.items():
         page_size = 100
@@ -528,26 +531,39 @@ def sync_headers_for_branch(branch):
                 ))
                 conn.commit()
 
-                # Supabase Write
-                sb_req("POST", "HEADER", {"on_conflict": "DOX_KEY"}, row)
+                headers_to_upsert.append(row)
 
-                # Cache maximum references in local CASHEIO
+                # Cache maximum references
                 if row["DOX_REF"]:
                     ref_id = f"{branch.lower()}:references:/{meta['dox_type'].lower().replace(' ', '-')}"
-                    cursor.execute("""
-                    INSERT OR REPLACE INTO CASHEIO (id, BRANCH, CATEGORY, IDENTIFIER, KEY_VAL, METADATA, TIME_STAMP)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        ref_id, branch.upper(), "REFERENCES", f"/{meta['dox_type'].lower().replace(' ', '-')}",
-                        row["DOX_REF"], json.dumps({"date": date_str, "issued_to": b2b_val or staff_val}),
-                        int(time.time() * 1000)
-                    ))
-                    conn.commit()
+                    references_to_upsert.append({
+                        "id": ref_id,
+                        "BRANCH": branch.upper(),
+                        "CATEGORY": "REFERENCES",
+                        "IDENTIFIER": f"/{meta['dox_type'].lower().replace(' ', '-')}",
+                        "KEY_VAL": row["DOX_REF"],
+                        "METADATA": json.dumps({"date": date_str, "issued_to": b2b_val or staff_val}),
+                        "TIME_STAMP": int(time.time() * 1000)
+                    })
 
             if len(items) < page_size:
                 break
             skip += page_size
             time.sleep(0.05)
+
+    # Perform bulk Supabase Header writes
+    if headers_to_upsert:
+        sb_req("POST", "HEADER", {"on_conflict": "DOX_KEY"}, headers_to_upsert, prefer="resolution=merge-duplicates")
+
+    # Perform bulk SQLite & Supabase Reference writes
+    if references_to_upsert:
+        for ref in references_to_upsert:
+            cursor.execute("""
+            INSERT OR REPLACE INTO CASHEIO (id, BRANCH, CATEGORY, IDENTIFIER, KEY_VAL, METADATA, TIME_STAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (ref["id"], ref["BRANCH"], ref["CATEGORY"], ref["IDENTIFIER"], ref["KEY_VAL"], ref["METADATA"], ref["TIME_STAMP"]))
+        conn.commit()
+        sb_req("POST", "CASHEIO", {"on_conflict": "id"}, references_to_upsert, prefer="resolution=merge-duplicates")
 
     # Reconcile Orphans (deleted documents)
     cursor.execute("SELECT DOX_KEY, DOX_TYPE FROM HEADER WHERE BRANCH = ?", (branch.upper(),))
@@ -732,7 +748,7 @@ def sync_ledger_for_branch(branch):
             conn.commit()
 
             # Insert batch in Supabase
-            sb_req("POST", "LEDGER", {"Prefer": "resolution=merge-duplicates"}, ledger_batch)
+            sb_req("POST", "LEDGER", None, ledger_batch, prefer="resolution=merge-duplicates")
 
         if len(txns) < page_size:
             break

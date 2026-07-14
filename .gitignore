@@ -1,0 +1,7 @@
+__pycache__/
+data/
+ManagerServer
+libe_sqlite3.so
+render_env_vars.txt
+*.pyc
+*.pyo

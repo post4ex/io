@@ -44,6 +44,7 @@ FINANCIAL_GUIDS = {
 # In-memory checkpoints: { branch: last_processed_ticks }
 checkpoints   = {}
 checkpoint_dir = "/app"
+last_backup_mtimes = {}
 
 
 def ticks_to_datetime(ticks):
@@ -349,6 +350,11 @@ def backup_to_supabase():
             filepath = os.path.join(root, file)
             rel_path = os.path.relpath(filepath, ROOT_DIR)
             try:
+                mtime = os.path.getmtime(filepath)
+                # Skip unchanged files since last backup
+                if rel_path in last_backup_mtimes and last_backup_mtimes[rel_path] == mtime:
+                    continue
+
                 with open(filepath, "rb") as f:
                     file_content = f.read()
                 quoted_path = urllib.parse.quote(rel_path)
@@ -365,6 +371,9 @@ def backup_to_supabase():
                 )
                 with urllib.request.urlopen(req, timeout=120) as resp:
                     logging.info(f"Successfully backed up '{rel_path}': {resp.read().decode()}")
+                
+                # Update checkpoint timestamp
+                last_backup_mtimes[rel_path] = mtime
             except Exception as e:
                 logging.error(f"Failed to backup '{rel_path}': {e}")
 
@@ -396,6 +405,21 @@ def main():
             logging.warning(f"Data path '{DATA_PATH}' does not exist on startup.")
     except Exception as e:
         logging.error(f"Error during initial scan: {e}")
+
+    # Initialize last_backup_mtimes with current local file timestamps to prevent redundant backups on startup
+    try:
+        if os.path.exists(ROOT_DIR):
+            for root, dirs, files in os.walk(ROOT_DIR):
+                for file in files:
+                    filepath = os.path.join(root, file)
+                    rel_path = os.path.relpath(filepath, ROOT_DIR)
+                    try:
+                        last_backup_mtimes[rel_path] = os.path.getmtime(filepath)
+                    except Exception:
+                        pass
+            logging.info(f"Initialized backup tracking for {len(last_backup_mtimes)} local file(s).")
+    except Exception as e:
+        logging.error(f"Error initializing backup tracking: {e}")
 
     last_backup_time = time.time()
 

@@ -17,8 +17,6 @@ RUN wget https://github.com/Manager-io/Manager/releases/latest/download/ManagerS
 
 RUN mkdir -p /mnt/bucket
 COPY sync_worker.py /app/sync_worker.py
-COPY cache_server.py /app/cache_server.py
-COPY router.py /app/router.py
 
 RUN cat > start.sh << 'EOF'
 #!/bin/bash
@@ -47,35 +45,22 @@ echo "Manager.io data path: $DATA_PATH"
 echo "Restoring databases from Supabase..."
 python3 /app/sync_worker.py --restore-only
 
-# 1. Start Manager.io internally on port 8080
-echo "Starting Manager.io internally on port 8080..."
+echo "Starting Manager.io on port $RUN_PORT..."
+
 cd /app
-./ManagerServer --urls "http://127.0.0.1:8080" --path "$DATA_PATH" &
+./ManagerServer --urls "http://0.0.0.0:$RUN_PORT" --path "$DATA_PATH" &
 MANAGER_PID=$!
 echo "Manager.io started with PID: $MANAGER_PID"
 
-# 2. Start Cache Server internally on port 8000
-echo "Starting Cache Server internally on port 8000..."
-python3 /app/cache_server.py &
-CACHE_PID=$!
-echo "Cache Server started with PID: $CACHE_PID"
-
-# 3. Start Proxy Router publicly on port $RUN_PORT
-echo "Starting Proxy Router publicly on port $RUN_PORT..."
-python3 /app/router.py &
-ROUTER_PID=$!
-echo "Proxy Router started with PID: $ROUTER_PID"
-
-# 4. Start SQLite changes watcher daemon
-echo "Starting SQLite changes watcher daemon..."
+# Start SQLite changes watcher daemon
 python3 /app/sync_worker.py &
 WATCHER_PID=$!
-echo "Sync watcher started with PID: $WATCHER_PID"
+echo "Sync worker started with PID: $WATCHER_PID"
 
-# Warmup: wait for router to respond to ping
+# Warmup: wait for server and hit it once so HF Space health check passes quickly
 for i in $(seq 1 30); do
-    if curl -s -o /dev/null http://127.0.0.1:$RUN_PORT/ping 2>/dev/null; then
-        echo "Proxy Router is responding, health check passed"
+    if curl -s -o /dev/null http://127.0.0.1:$RUN_PORT/ 2>/dev/null; then
+        echo "Manager.io is responding, health check passed"
         break
     fi
     sleep 1
@@ -88,33 +73,17 @@ while true; do
     if ! kill -0 $MANAGER_PID 2>/dev/null; then
         echo "Manager crashed, restarting..."
         cd /app
-        ./ManagerServer --urls "http://127.0.0.1:8080" --path "$DATA_PATH" &
+        ./ManagerServer --urls http://0.0.0.0:$RUN_PORT --path "$DATA_PATH" &
         MANAGER_PID=$!
         echo "Manager.io restarted with PID: $MANAGER_PID"
     fi
 
-    # Restart Cache Server if crashed
-    if ! kill -0 $CACHE_PID 2>/dev/null; then
-        echo "Cache Server crashed, restarting..."
-        python3 /app/cache_server.py &
-        CACHE_PID=$!
-        echo "Cache Server restarted with PID: $CACHE_PID"
-    fi
-
-    # Restart Router if crashed
-    if ! kill -0 $ROUTER_PID 2>/dev/null; then
-        echo "Proxy Router crashed, restarting..."
-        python3 /app/router.py &
-        ROUTER_PID=$!
-        echo "Proxy Router restarted with PID: $ROUTER_PID"
-    fi
-
     # Restart Watcher if crashed
     if ! kill -0 $WATCHER_PID 2>/dev/null; then
-        echo "Sync watcher crashed, restarting..."
+        echo "Sync worker crashed, restarting..."
         python3 /app/sync_worker.py &
         WATCHER_PID=$!
-        echo "Sync watcher restarted with PID: $WATCHER_PID"
+        echo "Sync worker restarted with PID: $WATCHER_PID"
     fi
 done
 EOF

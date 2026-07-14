@@ -199,35 +199,50 @@ def sync_databases_on_startup():
     os.makedirs(ROOT_DIR, exist_ok=True)
     
     try:
-        # 1. List files recursively in Supabase bucket under folder path
-        list_url = f"{supabase_url}/storage/v1/object/list/{supabase_bucket}"
-        req = urllib.request.Request(
-            list_url,
-            data=json.dumps({
-                "prefix": supabase_folder,
-                "options": {
-                    "recursive": True
-                }
-            }).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {supabase_key}",
-                "Content-Type": "application/json"
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            files_metadata = json.loads(resp.read().decode())
-            
+        # 1. List files recursively in Supabase bucket under folder path using queue-based walk
+        raw_files = []
+        queue = [supabase_folder]
+        while queue:
+            current_prefix = queue.pop(0)
+            list_url = f"{supabase_url}/storage/v1/object/list/{supabase_bucket}"
+            req = urllib.request.Request(
+                list_url,
+                data=json.dumps({
+                    "prefix": current_prefix,
+                    "options": {
+                        "limit": 100,
+                        "sortBy": {"column": "name", "order": "asc"}
+                    }
+                }).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {supabase_key}",
+                    "Content-Type": "application/json"
+                },
+                method="POST"
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    items = json.loads(resp.read().decode())
+                for item in items:
+                    name = item.get("name")
+                    if not name or name == "test.txt":
+                        continue
+                    full_path = f"{current_prefix}/{name}" if current_prefix else name
+                    if item.get("id") is None:
+                        # It's a directory, add to search queue
+                        queue.append(full_path)
+                    else:
+                        # It's a file
+                        raw_files.append(full_path)
+            except Exception as le:
+                logging.error(f"Error listing prefix {current_prefix}: {le}")
+                
         sb_files = []
         prefix_to_remove = f"{supabase_folder}/"
-        for f in files_metadata:
-            name = f.get("name")
-            if not name or name == "test.txt" or f.get("id") is None:
-                continue
-            # Remove leading folder prefix if present in the returned name
-            if name.startswith(prefix_to_remove):
-                name = name[len(prefix_to_remove):]
-            sb_files.append(name)
+        for full_path in raw_files:
+            if full_path.startswith(prefix_to_remove):
+                name = full_path[len(prefix_to_remove):]
+                sb_files.append(name)
             
         logging.info(f"Supabase storage files found: {sb_files}")
         

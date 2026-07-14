@@ -72,7 +72,8 @@ def sb_get_all(table):
 def request_local_manager(method, path, branch):
     api_key = os.getenv(f"{branch.upper()}_MANAGER_API_KEY")
     if not api_key:
-        raise ValueError(f"No API key found for branch {branch}")
+        logging.warning(f"No API key found for branch {branch} in env. Skipping request.")
+        return {}
         
     url = f"http://127.0.0.1:8080/api2/{path.lstrip('/')}"
     headers = {
@@ -80,13 +81,17 @@ def request_local_manager(method, path, branch):
         "Accept": "application/json",
         "Content-Type": "application/json"
     }
-    req = urllib.request.Request(url, headers=headers, method=method.upper())
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        logging.error(f"Error querying local Manager.io on {url}: {e}")
-        raise e
+    for attempt in range(3):
+        req = urllib.request.Request(url, headers=headers, method=method.upper())
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            if attempt == 2:
+                logging.error(f"Error querying local Manager.io on {url} (attempt 3/3): {e}")
+                raise e
+            logging.warning(f"Error querying local Manager.io on {url} (attempt {attempt+1}/3): {e}. Retrying in 1s...")
+            time.sleep(1)
 
 # ---------------------------------------------------------------------------
 # METADATA & CONFIGURATION
@@ -975,7 +980,20 @@ def main():
     # Step 1: Sync B2B, STAFF metadata tables from Supabase on start
     refresh_local_metadata_cache()
 
-    # Step 2: Perform initial full sync for all active branches
+    # Step 2: Wait for local ManagerServer to respond
+    logging.info("Waiting for local ManagerServer on 127.0.0.1:8080 to respond...")
+    for _ in range(30):
+        try:
+            req = urllib.request.Request("http://127.0.0.1:8080/")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                if resp.getcode() == 200:
+                    logging.info("Local ManagerServer detected and responding.")
+                    break
+        except Exception:
+            pass
+        time.sleep(1)
+
+    # Step 3: Perform initial full sync for all active branches
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT BRANCH_CODE FROM BRANCHES")

@@ -4,7 +4,8 @@ set -e
 echo "===== Application Startup at $(date -u '+%Y-%m-%d %H:%M:%S') ====="
 
 # Load unified .env if available
-ENV_FILE="/home/arun/POST4EX/FASTAPI/core/.env"
+ENV_FILE="/home/post4ex/FASTAPI/core/.env"
+[ ! -f "$ENV_FILE" ] && ENV_FILE="$(pwd)/../FASTAPI/core/.env"
 if [ -f "$ENV_FILE" ]; then
     set -a
     . "$ENV_FILE"
@@ -16,6 +17,16 @@ if [ -f "$ENV_FILE" ]; then
     [ -n "$TIDB_PASSWORD" ] && export DB_PASSWORD="$TIDB_PASSWORD"
     echo "✓ Loaded unified environment variables from $ENV_FILE"
 fi
+
+# Tune PHP-FPM for on-demand memory saving (hibernates when idle)
+for fpm_conf in /usr/local/etc/php-fpm.d/www.conf /etc/php/*/fpm/pool.d/www.conf; do
+    if [ -f "$fpm_conf" ]; then
+        sed -i 's/^pm = .*/pm = ondemand/' "$fpm_conf" 2>/dev/null || true
+        sed -i 's/^pm.max_children = .*/pm.max_children = 5/' "$fpm_conf" 2>/dev/null || true
+        sed -i 's/^pm.process_idle_timeout = .*/pm.process_idle_timeout = 10s/' "$fpm_conf" 2>/dev/null || true
+        echo "✓ Tuned PHP-FPM for on-demand low memory footprint"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # External database (TiDB Cloud etc. via HF Space Secrets) vs embedded MariaDB

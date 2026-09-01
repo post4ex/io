@@ -34,10 +34,14 @@ return [
     'connections' => [
 
         // single database setup
-        'mysql' => [
+        'mysql' => env('DB_CONNECTION') === 'sqlite' ? [
+            'driver'   => 'sqlite',
+            'database' => env('DB_DATABASE', database_path('database.sqlite')),
+            'prefix'   => '',
+        ] : [
             'driver'         => 'mysql',
             'host'           => env('DB_HOST1', env('DB_HOST', '127.0.0.1')),
-            'database'       => env('DB_DATABASE1', env('DB_DATABASE', 'forge')),
+            'database'       => env('DB_DATABASE1', env('DB_DATABASE', 'invoiceninja')),
             'username'       => env('DB_USERNAME1', env('DB_USERNAME', 'forge')),
             'password'       => env('DB_PASSWORD1', env('DB_PASSWORD', '')),
             'port'           => env('DB_PORT1', env('DB_PORT', '3306')),

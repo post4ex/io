@@ -1,0 +1,1 @@
+import{Ft as e,Pt as t,Ri as n,St as r}from"./forms-D87SCpr9.js";function i({entity:i}){let a=n();return n=>{n.length&&(e.processing(),a.fetchQuery({queryKey:[`/api/v1/${i}s/bulk`],queryFn:()=>t(`POST`,r(`/api/v1/${i}s/bulk`),{action:`bulk_download`,ids:n}).then(t=>(e.success(`downloaded_entities`),t))}))}}export{i as t};

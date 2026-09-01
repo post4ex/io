@@ -1,0 +1,1 @@
+var e=function(e){return e[e.Draft=1]=`Draft`,e[e.PendingApproval=2]=`PendingApproval`,e[e.Approved=3]=`Approved`,e[e.Rejected=4]=`Rejected`,e[e.Sent=5]=`Sent`,e[e.Completed=6]=`Completed`,e[e.Expired=7]=`Expired`,e[e.Voided=8]=`Voided`,e}({});export{e as t};

@@ -1,0 +1,292 @@
+<?php
+
+/**
+ * client Ninja (https://invoiceninja.com).
+ *
+ * @link https://github.com/invoiceninja/invoiceninja source repository
+ *
+ * @copyright Copyright (c) 2022. client Ninja LLC (https://invoiceninja.com)
+ *
+ * @license https://www.elastic.co/licensing/elastic-license
+ */
+
+namespace App\Import\Transformer\Csv;
+
+use App\Import\ImportException;
+use App\Import\Transformer\BaseTransformer;
+use App\Models\Invoice;
+use App\Utils\Traits\CleanLineItems;
+
+/**
+ * Class InvoiceTransformer.
+ */
+class InvoiceTransformer extends BaseTransformer
+{
+    use CleanLineItems;
+    /**
+     * @param $line_items_data
+     *
+     * @return bool|array
+     */
+    public function transform($line_items_data)
+    {
+
+        if (!empty($line_items_data) && is_array(reset($line_items_data))) {
+            // Nested array (array of arrays)
+            $invoice_data = reset($line_items_data);
+        } else {
+            // Flat array
+            $invoice_data = $line_items_data;
+            $line_items_data = [$invoice_data];
+        }
+
+        // $invoice_data = reset($line_items_data);
+
+        if (isset($invoice_data['invoice.number']) && $this->hasInvoice($invoice_data['invoice.number'])) {
+            throw new ImportException('Invoice number already exists');
+        }
+
+        $invoiceStatusMap = [
+            'sent' => Invoice::STATUS_SENT,
+            'draft' => Invoice::STATUS_DRAFT,
+            'paid' => Invoice::STATUS_PAID,
+            '1' => Invoice::STATUS_PAID,
+            '0' => Invoice::STATUS_SENT,
+            'true' => Invoice::STATUS_PAID,
+            'false' => Invoice::STATUS_SENT,
+            '' => Invoice::STATUS_SENT,
+            'yes' => Invoice::STATUS_PAID,
+            'no' => Invoice::STATUS_SENT,
+        ];
+
+        $status = strtolower($this->getString($invoice_data, 'invoice.status'));
+        $statusId = $invoiceStatusMap[$status] ?? Invoice::STATUS_SENT;
+
+        if ($status === '' && array_key_exists('invoice.is_sent', $invoice_data)) {
+            $statusId = $this->toBoolean($invoice_data['invoice.is_sent'])
+                ? Invoice::STATUS_SENT
+                : Invoice::STATUS_DRAFT;
+        }
+
+        $transformed = [
+            'company_id' => $this->company->id,
+            'number' => $this->getString($invoice_data, 'invoice.number', null),
+            'user_id' => $this->getString($invoice_data, 'invoice.user_id'),
+            'amount' => ($amount = $this->getFloat(
+                $invoice_data,
+                'invoice.amount'
+            )),
+            'balance' => isset($invoice_data['invoice.balance'])
+                ? $this->getFloat($invoice_data, 'invoice.balance')
+                : $amount,
+            'client_id' => $this->getClient(
+                $this->getString($invoice_data, 'client.name'),
+                $this->getString($invoice_data, 'client.email')
+            ),
+            'discount' => $this->getFloat($invoice_data, 'invoice.discount'),
+            'po_number' => $this->getString($invoice_data, 'invoice.po_number'),
+            'date' => isset($invoice_data['invoice.date'])
+                ? $this->parseDate($invoice_data['invoice.date'])
+                : now()->format('Y-m-d'),
+            'due_date' => isset($invoice_data['invoice.due_date'])
+                ? $this->parseDate($invoice_data['invoice.due_date'])
+                : null,
+            'terms' => $this->getString($invoice_data, 'invoice.terms'),
+            'public_notes' => $this->getString(
+                $invoice_data,
+                'invoice.public_notes'
+            ),
+            'private_notes' => $this->getString(
+                $invoice_data,
+                'invoice.private_notes'
+            ),
+            'tax_name1' => $this->getString($invoice_data, 'invoice.tax_name1'),
+            'tax_rate1' => $this->getFloat($invoice_data, 'invoice.tax_rate1'),
+            'tax_name2' => $this->getString($invoice_data, 'invoice.tax_name2'),
+            'tax_rate2' => $this->getFloat($invoice_data, 'invoice.tax_rate2'),
+            'tax_name3' => $this->getString($invoice_data, 'invoice.tax_name3'),
+            'tax_rate3' => $this->getFloat($invoice_data, 'invoice.tax_rate3'),
+            'is_amount_discount' => filter_var(
+                $this->getString($invoice_data, 'invoice.is_amount_discount'),
+                FILTER_VALIDATE_BOOLEAN
+            ),
+            'custom_value1' => $this->getCustomFieldValue('invoice1', $this->getString(
+                $invoice_data,
+                'invoice.custom_value1'
+            )),
+            'custom_value2' => $this->getCustomFieldValue('invoice2', $this->getString(
+                $invoice_data,
+                'invoice.custom_value2'
+            )),
+            'custom_value3' => $this->getCustomFieldValue('invoice3', $this->getString(
+                $invoice_data,
+                'invoice.custom_value3'
+            )),
+            'custom_value4' => $this->getCustomFieldValue('invoice4', $this->getString(
+                $invoice_data,
+                'invoice.custom_value4'
+            )),
+            'footer' => $this->getString($invoice_data, 'invoice.footer'),
+            'partial' => $this->getFloat($invoice_data, 'invoice.partial') > 0 ? $this->getFloat($invoice_data, 'invoice.partial') : null,
+            'partial_due_date' =>  !empty($invoice_data['invoice.partial_due_date']) ? $this->parseDate($invoice_data['invoice.partial_due_date']) : null,
+            'custom_surcharge1' => $this->getFloat(
+                $invoice_data,
+                'invoice.custom_surcharge1'
+            ),
+            'custom_surcharge2' => $this->getFloat(
+                $invoice_data,
+                'invoice.custom_surcharge2'
+            ),
+            'custom_surcharge3' => $this->getFloat(
+                $invoice_data,
+                'invoice.custom_surcharge3'
+            ),
+            'custom_surcharge4' => $this->getFloat(
+                $invoice_data,
+                'invoice.custom_surcharge4'
+            ),
+            'status_id' => $statusId,
+            'auto_bill_enabled' => $this->company->getSetting('auto_bill_standard_invoices'),
+            // 'archived' => $status === 'archived',
+        ];
+
+        if (array_key_exists('invoice.exchange_rate', $invoice_data)) {
+            $transformed['exchange_rate'] = $this->getFloatOrOne($invoice_data, 'invoice.exchange_rate');
+        }
+
+        if (array_key_exists('invoice.uses_inclusive_taxes', $invoice_data)) {
+            $transformed['uses_inclusive_taxes'] = $this->toBoolean($invoice_data['invoice.uses_inclusive_taxes']);
+        }
+
+        /* If we can't find the client, then lets try and create a client */
+        if (! $transformed['client_id']) {
+            $client_transformer = new ClientTransformer($this->company);
+
+            $transformed['client'] = $client_transformer->transform(
+                $invoice_data
+            );
+        }
+
+        if(empty($transformed['number'])){
+unset($transformed['number']);
+        }
+
+        $currency = $this->company->currency();
+
+        $payment_amount =round($this->getFloat(
+            $invoice_data,
+            'payment.amount'
+        ), $currency->precision);
+
+        if ($payment_amount > 0) {
+            
+            $transformed['payments'] = [
+                [
+                    'date' => isset($invoice_data['payment.date'])
+                        ? $this->parseDate($invoice_data['payment.date'])
+                        : date('y-m-d'),
+                    'transaction_reference' => $this->getString(
+                        $invoice_data,
+                        'payment.transaction_reference'
+                    ),
+                    'amount' => $payment_amount,
+                ],
+            ];
+        } elseif ($status === 'paid' || $transformed['status_id'] === Invoice::STATUS_PAID) {
+            $transformed['payments'] = [
+                [
+                    'date' => isset($invoice_data['payment.date'])
+                        ? $this->parseDate($invoice_data['payment.date'])
+                        : date('y-m-d'),
+                    'transaction_reference' => $this->getString(
+                        $invoice_data,
+                        'payment.transaction_reference'
+                    ),
+                    'amount' => $this->getFloat(
+                        $invoice_data,
+                        'invoice.amount'
+                    ),
+                ],
+            ];
+        } elseif (
+            isset($invoice_data['invoice.balance'])
+            && $amount > 0
+            && $transformed['balance'] < $amount
+        ) {
+            // An explicit balance less than the invoice amount implies a partial payment has
+            // already been made. Create an implied payment for the paid portion so that the
+            // invoice balance and client balance are both set correctly during import.
+            // Without this, calc()->getInvoice() resets balance to the full amount because
+            // paid_to_date is 0, causing the client balance to be over-counted.
+            $currency = $this->company->currency();
+            $implied_paid = round($amount - $transformed['balance'], $currency->precision);
+
+            if ($implied_paid > 0) {
+                $transformed['payments'] = [
+                    [
+                        'date' => isset($invoice_data['payment.date'])
+                            ? $this->parseDate($invoice_data['payment.date'])
+                            : date('Y-m-d'),
+                        'transaction_reference' => $this->getString(
+                            $invoice_data,
+                            'payment.transaction_reference'
+                        ),
+                        'amount' => $implied_paid,
+                    ],
+                ];
+            }
+        }
+
+
+        $line_items = [];
+
+        foreach ($line_items_data as $record) {
+            $line_items[] = [
+                'quantity' => $this->getFloat($record, 'item.quantity'),
+                'cost' => $this->getFloat($record, 'item.cost'),
+                'product_cost' => $this->getFloat($record, 'item.product_cost'),
+                'product_key' => $this->getString($record, 'item.product_key'),
+                'notes' => $this->getString($record, 'item.notes'),
+                'discount' => $this->getFloat($record, 'item.discount'),
+                'is_amount_discount' => filter_var(
+                    $this->getString($record, 'item.is_amount_discount'),
+                    FILTER_VALIDATE_BOOLEAN
+                ),
+                'tax_name1' => $this->getString($record, 'item.tax_name1'),
+                'tax_rate1' => $this->getFloat($record, 'item.tax_rate1'),
+                'tax_name2' => $this->getString($record, 'item.tax_name2'),
+                'tax_rate2' => $this->getFloat($record, 'item.tax_rate2'),
+                'tax_name3' => $this->getString($record, 'item.tax_name3'),
+                'tax_rate3' => $this->getFloat($record, 'item.tax_rate3'),
+                'custom_value1' => $this->getCustomFieldValue('product1', $this->getString(
+                    $record,
+                    'item.custom_value1'
+                )),
+                'custom_value2' => $this->getCustomFieldValue('product2', $this->getString(
+                    $record,
+                    'item.custom_value2'
+                )),
+                'custom_value3' => $this->getCustomFieldValue('product3', $this->getString(
+                    $record,
+                    'item.custom_value3'
+                )),
+                'custom_value4' => $this->getCustomFieldValue('product4', $this->getString(
+                    $record,
+                    'item.custom_value4'
+                )),
+                'type_id' => $this->getInvoiceTypeId($record, 'item.type_id'),
+                'tax_id' => $this->getString($record, 'item.tax_id'),
+            ];
+        }
+
+        /** Support minimal invoice creation with just an amount */
+        if (count($line_items) == 1 && intval($line_items[0]['cost']) == 0 && intval($line_items[0]['quantity']) == 0 && intval($transformed['amount']) != 0) {
+            $line_items[0]['quantity'] = 1;
+            $line_items[0]['cost'] = $transformed['amount'];
+        }
+
+        $transformed['line_items'] = $this->cleanItems($line_items);
+
+        return $transformed;
+    }
+}

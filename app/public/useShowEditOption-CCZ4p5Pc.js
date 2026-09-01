@@ -1,0 +1,1 @@
+import{Tr as e}from"./forms-D87SCpr9.js";function t(){let t=e();return e=>!e.invoice_id||!t?.invoice_task_lock}export{t};

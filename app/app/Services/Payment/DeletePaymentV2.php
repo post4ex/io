@@ -1,0 +1,365 @@
+<?php
+
+/**
+ * Invoice Ninja (https://invoiceninja.com).
+ *
+ * @link https://github.com/invoiceninja/invoiceninja source repository
+ *
+ * @copyright Copyright (c) 2026. Invoice Ninja LLC (https://invoiceninja.com)
+ *
+ * @license https://www.elastic.co/licensing/elastic-license
+ */
+
+namespace App\Services\Payment;
+
+use App\Models\Credit;
+use App\Models\Invoice;
+use App\Models\Payment;
+use App\Models\Paymentable;
+use App\Models\BankTransaction;
+use App\Listeners\Payment\PaymentTransactionEventEntry;
+use App\Listeners\Invoice\InvoiceTransactionEventEntryCash;
+use App\Services\EDocument\Standards\France\FrancePaymentApplicationRecorder;
+use App\Utils\BcMath;
+use Illuminate\Contracts\Container\BindingResolutionException;
+use Illuminate\Support\Str;
+
+class DeletePaymentV2
+{
+    private string $_paid_to_date_deleted = '0';
+
+    private string $total_payment_amount = '0';
+
+    /** @var array<int, array<string, mixed>> */
+    private array $tax_event_snapshots = [];
+
+    private string $mutation_key = '';
+    /**
+     * @param Payment $payment
+     * @return void
+     */
+    public function __construct(public Payment $payment, private bool $update_client_paid_to_date) {}
+
+    /**
+     * @return Payment
+     * @throws BindingResolutionException
+     */
+    public function run()
+    {
+        $this->mutation_key = "payment_deleted:{$this->payment->id}:" . Str::uuid();
+
+        \DB::connection(config('database.default'))->transaction(function () {
+            $this->payment = Payment::withTrashed()->where('id', $this->payment->id)->lockForUpdate()->first();
+
+            if ($this->payment && !$this->payment->is_deleted) {
+                $this->setStatus(Payment::STATUS_CANCELLED) //sets status of payment
+                    ->updateCreditables() //return the credits first
+                    ->adjustInvoices()
+                    ->deletePaymentables()
+                    ->cleanupPayment()
+                    ->save();
+            }
+        }, 2);
+
+        return $this->payment;
+    }
+
+    private function cleanupPayment()
+    {
+
+        $this->payment->is_deleted = true;
+        $this->payment->delete();
+
+        BankTransaction::query()->where('payment_id', $this->payment->id)->cursor()->each(function ($bt) {
+            $bt->invoice_ids = null;
+            $bt->payment_id = null;
+            $bt->status_id = 1;
+            $bt->save();
+        });
+
+        return $this;
+    }
+
+    /**
+     * Saves the payment.
+     *
+     * @return Payment $payment
+     */
+    private function save()
+    {
+        $this->payment->save();
+
+        return $this->payment;
+    }
+
+
+    private function setStatus($status): self
+    {
+        $this->payment->status_id = $status;
+
+        return $this;
+    }
+
+    /**
+     * Iterates through the credit pivot records and updates the balance and paid to date.
+     *
+     * @return self
+     */
+    private function updateCreditables(): self
+    {
+        if ($this->payment->credits()->exists()) {
+            $this->payment->credits()->each(function ($paymentable_credit) {
+                $multiplier = 1;
+
+                //balance remaining on the credit that can offset the paid to date.
+                $net_credit_amount = BcMath::sub($paymentable_credit->pivot->amount, $paymentable_credit->pivot->refunded, 2);
+
+                //Updates the Global Total Payment Amount that can later be used to adjust the paid to date.
+                $this->total_payment_amount = BcMath::add($this->total_payment_amount, $net_credit_amount, 2);
+
+                //Negative payments need cannot be "subtracted" from the paid to date. so the operator needs to be reversed.
+                if (BcMath::lessThan($net_credit_amount, 0, 2)) {
+                    $multiplier = -1;
+                }
+
+                //Reverses the operator for the balance and paid to date this allows the amount to be "subtracted" from the paid to date.
+                $balance_multiplier = BcMath::mul($multiplier, -1, 0);
+
+                $balance_net_credit_amount = BcMath::mul($net_credit_amount, $balance_multiplier, 2);
+
+                $paymentable_credit->service()
+                                   ->updateBalance($balance_net_credit_amount)
+                                   ->updatePaidToDate($balance_net_credit_amount)
+                                   ->setStatus(Credit::STATUS_SENT)
+                                   ->save();
+
+                if (!$paymentable_credit->is_deleted) {
+                    $client = $this->payment->client->fresh();
+
+                    $client->service()
+                            ->adjustCreditBalance($net_credit_amount)
+                            ->save();
+                }
+            });
+        }
+
+        return $this;
+    }
+
+    /**
+     * Iterates through the invoice pivot records and updates the balance and paid to date.
+     *
+     * @return self
+     */
+    private function adjustInvoices(): self
+    {
+        if ($this->payment->invoices()->exists()) {
+
+            $this->captureTaxEventSnapshots();
+
+            //Updates the Global Total Payment Amount that can later be used to adjust the paid to date.
+            $this->total_payment_amount = BcMath::add($this->total_payment_amount, BcMath::sub($this->payment->amount, $this->payment->refunded, 2), 2);
+
+            $this->payment->invoices()->each(function ($paymentable_invoice) {
+
+                if ($paymentable_invoice->status_id == Invoice::STATUS_REVERSED) {
+                    $this->update_client_paid_to_date = false;
+                    return;
+                }
+
+                $net_deletable = BcMath::sub($paymentable_invoice->pivot->amount, $paymentable_invoice->pivot->refunded, 2);
+
+                $this->_paid_to_date_deleted = BcMath::add($this->_paid_to_date_deleted, $net_deletable, 2);
+
+                /* Lock the invoice row to prevent races with concurrent MarkPaid / ApplyPayment.
+                   Without this, MarkPaid can read a mid-flight balance and either create a $0
+                   payment or set status incorrectly. */
+
+                /** 2026-05-05 - Take a lock on the invoice row to prevent race conditions with MarkPaid */
+                $paymentable_invoice = Invoice::withTrashed()
+                    ->where('id', $paymentable_invoice->id)
+                    ->lockForUpdate()
+                    ->first();
+
+                /** For cancelled invoices, we only reduce the paid to date - balance never changes */
+                if ($paymentable_invoice->status_id == Invoice::STATUS_CANCELLED) {
+                    $is_trashed = false;
+
+                    if ($paymentable_invoice->trashed()) {
+                        $is_trashed = true;
+                        $paymentable_invoice->restore();
+                    }
+
+                    $paymentable_invoice->service()
+                                        ->updatePaidToDate(BcMath::mul($net_deletable, -1, 2))
+                                        ->save();
+
+                    if ($net_deletable > 0) {
+                        $this->payment
+                             ->client
+                             ->service()
+                             ->updatePaidToDate(BcMath::mul($net_deletable, -1, 2))
+                             ->save();
+                    }
+
+                    if ($is_trashed) {
+                        $paymentable_invoice->delete();
+                    }
+
+                } elseif (!$paymentable_invoice->is_deleted) {
+                    $paymentable_invoice->restore();
+
+                    $paymentable_invoice = $paymentable_invoice->service()
+                                        ->updateBalance($net_deletable)
+                                        ->updatePaidToDate(BcMath::mul($net_deletable, -1, 2))
+                                        ->save();
+
+                    $paymentable_invoice->ledger()
+                                        ->updateInvoiceBalance($net_deletable, "Adjusting invoice {$paymentable_invoice->number} due to deletion of Payment {$this->payment->number}")
+                                        ->save();
+
+                    //Negative Payments need to be dealt with differently.
+                    if ($net_deletable > 0) {
+                        $_applicable_paid_to_date = BcMath::mul($net_deletable, -1, 2);
+                    } else {
+                        $_applicable_paid_to_date = '0';
+                    }
+
+                    $this->payment
+                         ->client
+                         ->service()
+                         ->updateBalanceAndPaidToDate($net_deletable, $_applicable_paid_to_date) // if negative, set to 0, the paid to date will be reduced further down.
+                         ->save();
+
+                    if (BcMath::equal($paymentable_invoice->balance, $paymentable_invoice->amount, 2)) {
+                        $paymentable_invoice->service()->setStatus(Invoice::STATUS_SENT)->save();
+                    } elseif (BcMath::equal($paymentable_invoice->balance, 0, 2)) {
+                        $paymentable_invoice->service()->setStatus(Invoice::STATUS_PAID)->save();
+                    } else {
+                        $paymentable_invoice->service()->setStatus(Invoice::STATUS_PARTIAL)->save();
+                    }
+                } else {
+                    $paymentable_invoice->restore();
+                    $paymentable_invoice->service()
+                                        ->updatePaidToDate(BcMath::mul($net_deletable, -1, 2))
+                                        ->save();
+                    $paymentable_invoice->delete();
+
+                }
+
+                // $paymentable_invoice->loadMissing(['client.country', 'client.company']);
+
+                // if ($paymentable_invoice->client->reportableFrTransaction()) {
+                //     $paymentable = Paymentable::withTrashed()
+                //         ->where('payment_id', $this->payment->id)
+                //         ->where('paymentable_id', $paymentable_invoice->id)
+                //         ->where('paymentable_type', 'invoices')
+                //         ->latest('id')
+                //         ->first();
+
+                //     app(FrancePaymentApplicationRecorder::class)->recordMovement(
+                //         payment: $this->payment,
+                //         invoice: $paymentable_invoice,
+                //         paymentable: $paymentable,
+                //         movementAmount: BcMath::mul($net_deletable, -1, 2),
+                //         movementDate: now($this->payment->company->timezone()?->name ?: config('app.timezone'))->toDateString(),
+                //         movementType: FrancePaymentApplicationRecorder::MOVEMENT_DELETED,
+                //         movementIdentity: $this->mutation_key . ':paymentable:' . $paymentable->id,
+                //     );
+                // }
+
+            });
+
+            if ($this->tax_event_snapshots !== []) {
+                PaymentTransactionEventEntry::dispatchSync(
+                    $this->payment->id,
+                    $this->tax_event_snapshots,
+                    $this->payment->company->db,
+                );
+            }
+
+        } elseif (BcMath::equal($this->payment->amount, $this->payment->applied, 2)) {
+            $this->update_client_paid_to_date = false;
+
+        }
+
+
+        if ($this->update_client_paid_to_date) {
+
+            if ($this->payment->amount < 0) {
+                $reduced_paid_to_date = BcMath::mul($this->payment->amount, -1, 2);
+            } else {
+                $_payment_sub = BcMath::sub($this->payment->amount, $this->payment->refunded, 2);
+                $reduced_paid_to_date = min(0, (BcMath::mul(BcMath::sub($_payment_sub, $this->_paid_to_date_deleted, 2), -1, 2)));
+            }
+
+            /** handle the edge case where a partial credit + unapplied payment is deleted */
+            if (!BcMath::equal($this->total_payment_amount, $this->_paid_to_date_deleted, 2)) {
+                $reduced_paid_to_date = min(0, BcMath::mul(BcMath::sub($this->total_payment_amount, $this->_paid_to_date_deleted, 2), -1, 2));
+            }
+
+            if (!BcMath::equal($reduced_paid_to_date, '0', 2)) {
+                $this->payment
+                    ->client
+                    ->service()
+                    ->updatePaidToDate($reduced_paid_to_date)
+                    ->save();
+            }
+        }
+
+        return $this;
+    }
+
+    private function captureTaxEventSnapshots(): void
+    {
+        $effective_date = now($this->payment->company->timezone()?->name ?: config('app.timezone'))->toDateString();
+        $mutation_key = $this->mutation_key;
+
+        Paymentable::query()
+            ->with(['payment' => fn ($query) => $query->withTrashed()])
+            ->where('payment_id', $this->payment->id)
+            ->where('paymentable_type', 'invoices')
+            ->whereNull('deleted_at')
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get()
+            ->each(function (Paymentable $paymentable) use ($effective_date, $mutation_key): void {
+                $amount = (float) $paymentable->amount - (float) $paymentable->refunded;
+                $invoice = Invoice::withTrashed()->find($paymentable->paymentable_id);
+
+                if (! $invoice || abs($amount) < 0.0001) {
+                    return;
+                }
+
+                $source = app(InvoiceTransactionEventEntryCash::class)
+                    ->runForPaymentable($invoice, $paymentable);
+
+                if (! $source) {
+                    return;
+                }
+
+                $this->tax_event_snapshots[] = [
+                    'source_event_id' => $source->id,
+                    'paymentable_id' => $paymentable->id,
+                    'invoice_id' => $invoice->id,
+                    'amount' => abs($amount),
+                    'effective_date' => $effective_date,
+                    'kind' => 'payment_deleted',
+                    'mutation_key' => $mutation_key,
+                    'correction_key' => sha1("{$mutation_key}|{$paymentable->id}"),
+                ];
+            });
+    }
+
+    private function deletePaymentables(): self
+    {
+        $this->payment->paymentables()
+                ->each(function ($pp) {
+                    $pp->forceDelete();
+                });
+
+        return $this;
+    }
+
+
+}

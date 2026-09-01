@@ -1,0 +1,1 @@
+import{t as e}from"./useCountries-V6UYORIt.js";function t(){let t=e();return e=>t.find(t=>t.id==e)}export{t};

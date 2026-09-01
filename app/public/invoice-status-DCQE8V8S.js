@@ -1,0 +1,1 @@
+var e=function(e){return e.Viewed=`-3`,e.Unpaid=`-2`,e.PastDue=`-1`,e.Draft=`1`,e.Sent=`2`,e.Partial=`3`,e.Paid=`4`,e.Cancelled=`5`,e.Reversed=`6`,e}({});export{e as t};

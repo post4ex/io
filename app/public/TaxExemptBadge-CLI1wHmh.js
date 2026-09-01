@@ -1,0 +1,1 @@
+import{a as e}from"./rolldown-runtime-CNC7AqOf.js";import{t}from"./jsx-runtime-CTknu7_t.js";import{t as n}from"./useTranslation-BsqE6et4.js";import{t as r}from"./Badge-Dpo3S7fA.js";var i=e(t(),1);function a({isTaxExempt:e}){let[t]=n();return e?(0,i.jsx)(r,{variant:`orange`,children:t(`tax_exempt`)}):null}export{a as t};

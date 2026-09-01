@@ -1,0 +1,1 @@
+import{Pt as e,Ri as t,St as n}from"./forms-D87SCpr9.js";function r(){let r=t();return{find:t=>r.fetchQuery({queryKey:[`/api/v1/clients`,t],queryFn:()=>e(`GET`,n(`/api/v1/clients/:id?include=group_settings`,{id:t})).then(e=>e.data.data),staleTime:1/0})}}export{r as t};

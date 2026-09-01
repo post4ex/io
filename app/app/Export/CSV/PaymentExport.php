@@ -1,0 +1,299 @@
+<?php
+
+/**
+ * Invoice Ninja (https://invoiceninja.com).
+ *
+ * @link https://github.com/invoiceninja/invoiceninja source repository
+ *
+ * @copyright Copyright (c) 2026. Invoice Ninja LLC (https://invoiceninja.com)
+ *
+ * @license https://www.elastic.co/licensing/elastic-license
+ */
+
+namespace App\Export\CSV;
+
+use App\Export\Decorators\Decorator;
+use App\Libraries\MultiDB;
+use App\Models\Company;
+use App\Models\Credit;
+use App\Models\Invoice;
+use App\Models\Payment;
+use App\Transformers\PaymentTransformer;
+use App\Utils\Ninja;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Relations\MorphTo;
+use Illuminate\Database\Eloquent\Relations\Relation;
+use Illuminate\Support\Facades\App;
+use League\Csv\Writer;
+
+class PaymentExport extends BaseExport
+{
+    private $entity_transformer;
+
+    public string $date_key = 'date';
+
+    public Writer $csv;
+
+    private Decorator $decorator;
+
+    private bool $fan_out = false;
+
+    private const APPLIED_TRIGGER_KEYS = ['invoice.number', 'credit.number'];
+
+    private const APPLIED_INJECTED_KEYS = [
+        'payment.applied_date',
+        'payment.applied_amount',
+        'payment.applied_refunded',
+    ];
+
+    public function __construct(Company $company, array $input)
+    {
+        $this->company = $company;
+        $this->input = $input;
+        $this->entity_transformer = new PaymentTransformer();
+        $this->decorator = new Decorator();
+    }
+
+    public function init(): Builder
+    {
+
+        MultiDB::setDb($this->company->db);
+        App::forgetInstance('translator');
+        App::setLocale($this->company->locale());
+        $t = app('translator');
+        $t->replace(Ninja::transformTranslations($this->company->settings));
+
+        if (count($this->input['report_keys']) == 0) {
+            $this->input['report_keys'] = array_values($this->payment_report_keys);
+        }
+
+        $this->input['report_keys'] = array_merge($this->input['report_keys'], array_diff($this->forced_client_fields, $this->input['report_keys']));
+
+        $this->fan_out = count(array_intersect(self::APPLIED_TRIGGER_KEYS, $this->input['report_keys'])) > 0;
+
+        if ($this->fan_out) {
+            $this->input['report_keys'] = array_merge(
+                $this->input['report_keys'],
+                array_diff(self::APPLIED_INJECTED_KEYS, $this->input['report_keys'])
+            );
+        }
+
+        $query = Payment::query()
+                            ->withTrashed()
+                            ->with($this->paymentReportRelations())
+                            ->whereHas('client', function ($q) {
+                                $q->where('is_deleted', false);
+                            })
+                            ->where('company_id', $this->company->id)
+                            ->where('is_deleted', 0);
+
+        $query = $this->addDateRange($query, 'payments');
+
+        $clients = &$this->input['client_id'];
+
+        if ($clients) {
+            $query = $this->addClientFilter($query, $clients);
+        }
+
+        $query = $this->addPaymentStatusFilters($query, $this->input['status'] ?? '');
+        $query = $this->addTagFilter($query);
+        $query = $this->filterByUserPermissions($query);
+
+        if ($this->input['document_email_attachment'] ?? false) {
+            $this->queueDocuments($query);
+        }
+
+        return $query;
+    }
+
+    public function returnJson()
+    {
+
+        $query = $this->init();
+
+        $headerdisplay = $this->buildHeader();
+
+        $header = collect($this->input['report_keys'])->map(function ($key, $value) use ($headerdisplay) {
+            return ['identifier' => $key, 'display_value' => $headerdisplay[$value]];
+        })->toArray();
+
+        $report = [];
+
+        $this->streamQuery($query)->each(function ($payment) use (&$report) {
+            /** @var \App\Models\Payment $payment */
+            $this->emitRows($payment, function (array $row) use (&$report, $payment) {
+                $report[] = $this->processMetaData($row, $payment);
+            });
+        });
+
+        return array_merge(['columns' => $header], $report);
+
+    }
+
+    public function run()
+    {
+        $query =  $this->init();
+        //load the CSV document from a string
+        $this->csv = Writer::fromString();
+        \League\Csv\CharsetConverter::addTo($this->csv, 'UTF-8', 'UTF-8');
+
+        //insert the header
+        $this->csv->insertOne($this->buildHeader());
+
+        $this->streamQuery($query)
+              ->each(function ($payment) {
+                  /** @var \App\Models\Payment $payment */
+                  $this->emitRows($payment, function (array $row) {
+                      $this->csv->insertOne($row);
+                  });
+              });
+
+        return $this->csv->toString();
+    }
+
+    private function paymentReportRelations(): array
+    {
+        $relations = ['client', 'tags'];
+        $keys = $this->input['report_keys'];
+
+        if (in_array('payment.user_id', $keys, true)) {
+            $relations[] = 'user';
+        }
+
+        if (in_array('payment.assigned_user_id', $keys, true)) {
+            $relations[] = 'assigned_user';
+        }
+
+        if ($this->fan_out) {
+            $relations['paymentables'] = function ($query): void {
+                $query->whereIn('paymentable_type', ['invoices', Credit::class]);
+
+                if (! ($this->input['include_deleted_applications'] ?? false)) {
+                    $query->whereNull('deleted_at');
+                } else {
+                    $query->withTrashed();
+                }
+
+                $query->orderBy('created_at')->orderBy('id');
+            };
+
+            $relations['paymentables.paymentable'] = function (Relation $relation): void {
+                if (! $relation instanceof MorphTo) {
+                    return;
+                }
+
+                $relation->constrain([
+                    Invoice::class => fn($query) => $query->withTrashed(),
+                    Credit::class => fn($query) => $query->withTrashed(),
+                ]);
+            };
+        }
+
+        return $relations;
+    }
+
+    private function emitRows(Payment $payment, \Closure $emit): void
+    {
+        if (! $this->fan_out) {
+            $emit($this->buildRow($payment));
+            return;
+        }
+
+        $paymentables = $this->loadPaymentables($payment);
+
+        if ($paymentables->isEmpty()) {
+            $payment->setRelation('current_paymentable', null);
+            $emit($this->buildRow($payment));
+            return;
+        }
+
+        foreach ($paymentables as $paymentable) {
+            $payment->setRelation('current_paymentable', $paymentable);
+            $emit($this->buildRow($payment));
+        }
+
+        $payment->setRelation('current_paymentable', null);
+    }
+
+    private function loadPaymentables(Payment $payment): \Illuminate\Support\Collection
+    {
+        if ($payment->relationLoaded('paymentables')) {
+            return $payment->paymentables;
+        }
+
+        $query = $payment->paymentables()
+            ->whereIn('paymentable_type', ['invoices', Credit::class])
+            ->with([
+                'paymentable' => function (Relation $relation): void {
+                    if (! $relation instanceof MorphTo) {
+                        return;
+                    }
+
+                    $relation->constrain([
+                        Invoice::class => fn($query) => $query->withTrashed(),
+                        Credit::class => fn($query) => $query->withTrashed(),
+                    ]);
+                },
+            ]);
+
+        if (! ($this->input['include_deleted_applications'] ?? false)) {
+            $query->whereNull('deleted_at');
+        } else {
+            $query->withTrashed();
+        }
+
+        return $query->orderBy('created_at')->orderBy('id')->get();
+    }
+
+    protected function buildRow(Payment $payment): array
+    {
+        $transformed_entity = $this->entity_transformer->transform($payment);
+
+        $entity = [];
+
+        foreach (array_values($this->input['report_keys']) as $key) {
+
+            $parts = explode('.', $key);
+
+            if (str_ends_with($key, '.tags')) {
+                $entity[$key] = $this->decorator->transform($key, $payment);
+                continue;
+            }
+
+            if ($parts[0] === 'payment' && isset($parts[1], $transformed_entity[$parts[1]])) {
+                $entity[$key] = $transformed_entity[$parts[1]];
+            } elseif (array_key_exists($key, $transformed_entity)) {
+                $entity[$key] = $transformed_entity[$key];
+            } else {
+                $entity[$key] = $this->decorator->transform($key, $payment);
+            }
+
+        }
+
+        $entity = $this->decorateAdvancedFields($payment, $entity);
+        return $this->convertFloats($entity, $this->fan_out ? ['payment' => $payment->id] : []);
+    }
+
+    protected function groupingIdentityForColumn(string $column): ?string
+    {
+        $is_payment_column = $this->fan_out
+            && str_starts_with($column, 'payment.')
+            && ! in_array($column, self::APPLIED_INJECTED_KEYS, true);
+
+        return $is_payment_column ? 'payment' : null;
+    }
+
+    private function decorateAdvancedFields(Payment $payment, array $entity): array
+    {
+
+        if (in_array('payment.assigned_user_id', $this->input['report_keys'])) {
+            $entity['payment.assigned_user_id'] = $payment->assigned_user ? $payment->assigned_user->present()->name() : '';
+        }
+
+        if (in_array('payment.user_id', $this->input['report_keys'])) {
+            $entity['payment.user_id'] = $payment->user ? $payment->user->present()->name() : '';
+        }
+
+        return $entity;
+    }
+}

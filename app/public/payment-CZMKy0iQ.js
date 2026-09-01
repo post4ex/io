@@ -1,0 +1,1 @@
+import{a as e}from"./rolldown-runtime-CNC7AqOf.js";import{t}from"./dayjs.min-wxmwWtJd.js";import{t as n}from"./utc-Vb5zyARk.js";var r=e(t(),1),i=e(n(),1);r.default.extend(i.default);function a(e,t){return e===0||e===``||e===void 0?``:typeof e==`number`?r.default.unix(e).utc().format(t):(0,r.default)(e).utc().format(t)}export{a as t};

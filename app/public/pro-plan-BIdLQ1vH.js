@@ -1,0 +1,1 @@
+import{kt as e}from"./forms-D87SCpr9.js";import{n as t}from"./enterprise-plan-CrOR44qE.js";function n(){return e()?!0:t.getState().companyUsers.api?.[t.getState().companyUsers.currentIndex]?.account.plan===`pro`}export{n as t};

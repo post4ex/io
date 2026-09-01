@@ -1,0 +1,501 @@
+<?php
+
+/**
+ * Invoice Ninja (https://invoiceninja.com).
+ *
+ * @link https://github.com/invoiceninja/invoiceninja source repository
+ *
+ * @copyright Copyright (c) 2026. Invoice Ninja LLC (https://invoiceninja.com)
+ *
+ * @license https://www.elastic.co/licensing/elastic-license
+ */
+
+namespace App\Filters;
+
+use App\Models\Invoice;
+use App\Utils\Traits\MakesHash;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Carbon;
+use InvalidArgumentException;
+use RuntimeException;
+
+/**
+ * InvoiceFilters.
+ */
+class InvoiceFilters extends QueryFilters
+{
+    use MakesHash;
+
+    /**
+     * Filter based on client status.
+     *
+     * Statuses we need to handle
+     * - all
+     * - paid
+     * - unpaid
+     * - overdue
+     * - reversed
+     *
+     * @param string $value The invoice status as seen by the client
+     * @return Builder
+     */
+    public function client_status(string $value = ''): Builder
+    {
+        if (strlen($value) == 0) {
+            return $this->builder;
+        }
+
+        $status_parameters = explode(',', $value);
+
+        if (in_array('all', $status_parameters)) {
+            return $this->builder;
+        }
+
+        $this->builder->where(function ($query) use ($status_parameters) {
+            $invoice_filters = [];
+
+            if (in_array('draft', $status_parameters)) {
+                $invoice_filters[] = Invoice::STATUS_DRAFT;
+            }
+
+            if (in_array('paid', $status_parameters)) {
+                $invoice_filters[] = Invoice::STATUS_PAID;
+            }
+
+            if (in_array('cancelled', $status_parameters)) {
+                $invoice_filters[] = Invoice::STATUS_CANCELLED;
+            }
+
+            if (in_array('unpaid', $status_parameters)) {
+                $invoice_filters[] = Invoice::STATUS_SENT;
+                $invoice_filters[] = Invoice::STATUS_PARTIAL;
+            }
+
+            if (count($invoice_filters) > 0) {
+                $query->whereIn('status_id', $invoice_filters);
+            }
+
+            if (in_array('overdue', $status_parameters)) {
+                $now = now()->addSeconds(auth()->user()->company()->utc_offset())->startOfDay()->format('Y-m-d');
+                $query->orWhere(function ($q) use ($now) {
+                    $q->whereIn('status_id', [Invoice::STATUS_SENT, Invoice::STATUS_PARTIAL])
+                      ->where(function ($qq) use ($now) {
+                          $qq->where('due_date', '<', $now)
+                             ->orWhere('partial_due_date', '<', $now);
+                      });
+                });
+            }
+        });
+
+        return $this->builder;
+    }
+
+    public function number(string $number = ''): Builder
+    {
+        if (strlen($number) == 0) {
+            return $this->builder;
+        }
+
+        return $this->builder->where('number', $number);
+    }
+
+    /**
+     * Filter based on search text.
+     *
+     * @param string $filter
+     * @return Builder
+     * @deprecated
+     */
+    public function filter(string $filter = ''): Builder
+    {
+        if (strlen($filter) == 0) {
+            return $this->builder;
+        }
+
+        return $this->builder->where(function ($query) use ($filter) {
+            $query->where('number', 'like', '%' . $filter . '%')
+                          ->orWhere('po_number', 'like', '%' . $filter . '%')
+                          ->orWhere('date', 'like', '%' . $filter . '%')
+                          ->orWhere('amount', 'like', '%' . $filter . '%')
+                          ->orWhere('balance', 'like', '%' . $filter . '%')
+                          ->orWhere('custom_value1', 'like', '%' . $filter . '%')
+                          ->orWhere('custom_value2', 'like', '%' . $filter . '%')
+                          ->orWhere('custom_value3', 'like', '%' . $filter . '%')
+                          ->orWhere('custom_value4', 'like', '%' . $filter . '%')
+                          ->orWhereHas('client', function ($q) use ($filter) {
+                              $q->where('name', 'like', '%' . $filter . '%');
+                          })
+                          ->orWhereHas('client.contacts', function ($q) use ($filter) {
+                              $q->where('first_name', 'like', '%' . $filter . '%')
+                                ->orWhere('last_name', 'like', '%' . $filter . '%')
+                                ->orWhere('email', 'like', '%' . $filter . '%');
+                          })
+                          ->orWhereHas('project', function ($q) use ($filter) {
+                              $q->where('name', 'like', '%' . $filter . '%');
+                          })
+                          ->orWhereRaw("
+                            JSON_UNQUOTE(JSON_EXTRACT(
+                                JSON_ARRAY(
+                                    JSON_UNQUOTE(JSON_EXTRACT(line_items, '$[*].notes')), 
+                                    JSON_UNQUOTE(JSON_EXTRACT(line_items, '$[*].product_key'))
+                                ), '$[*]')
+                            ) LIKE ?", ['%' . $filter . '%']);
+            //   ->orWhereRaw("JSON_UNQUOTE(JSON_EXTRACT(line_items, '$[*].notes')) LIKE ?", ['%'.$filter.'%']);
+        });
+    }
+
+    /**
+     * @return Builder
+     * @throws RuntimeException
+     */
+    public function status_id(string $status = ''): Builder
+    {
+
+        if (strlen($status) == 0) {
+            return $this->builder;
+        }
+
+        return $this->builder->whereIn('status_id', explode(",", $status));
+
+    }
+
+    /**
+     * @return Builder
+     * @return Builder
+     * @throws InvalidArgumentException
+     */
+    public function upcoming(): Builder
+    {
+
+        $now = now()->addSeconds(auth()->user()->company()->utc_offset())->startOfDay();
+
+        return $this->builder->where(function ($query) use ($now) {
+            $query->whereIn('status_id', [Invoice::STATUS_PARTIAL, Invoice::STATUS_SENT])
+            ->where('is_deleted', 0)
+            ->where('balance', '>', 0)
+            ->where(function ($query) use ($now) {
+
+                $query->whereNull('due_date')
+                    ->orWhere(function ($q) use ($now) {
+                        $q->where('due_date', '>=', $now)->where(function ($qq) {
+                            $qq->where('partial', 0)->orWhere('balance', '>', 0);
+                        });
+                    })
+                    ->orWhere(function ($q) use ($now) {
+                        $q->where('partial_due_date', '>=', $now)->where('partial', '>', 0);
+                    });
+
+            })
+            ->orderByRaw('ISNULL(due_date), due_date ' . 'desc')
+            ->orderByRaw('ISNULL(partial_due_date), partial_due_date ' . 'desc');
+        });
+
+    }
+
+    /**
+     * 
+     * @return Builder
+     * @throws InvalidArgumentException
+     */
+    public function overdue(): Builder
+    {
+        return $this->builder->where(function ($query) {
+
+            $now = now()->addSeconds(auth()->user()->company()->utc_offset())->startOfDay();
+
+            $query->whereIn('status_id', [Invoice::STATUS_SENT, Invoice::STATUS_PARTIAL])
+                    ->where('is_deleted', 0)
+                    ->where('balance', '>', 0)
+                    ->where(function ($query) use ($now) {
+                        $query->where('due_date', '<', $now)
+                            ->orWhere('partial_due_date', '<', $now);
+                    })
+                    ->orderBy('due_date', 'ASC');
+        });
+
+    }
+
+    /**
+     * @param string $client_id
+     * @return Builder
+     * @throws InvalidArgumentException
+     */
+    public function payable(string $client_id = ''): Builder
+    {
+
+        if (strlen($client_id) == 0) {
+            return $this->builder;
+        }
+        
+        /** if true, return all payable invoices */
+        if($client_id == strtolower('true'))
+        {
+            return $this->builder
+                        ->whereIn('status_id', [Invoice::STATUS_DRAFT, Invoice::STATUS_SENT, Invoice::STATUS_PARTIAL])
+                        ->where('is_deleted', 0)
+                        ->where('balance', '>', 0);
+        }
+
+        return $this->builder
+                    ->where('client_id', $this->decodePrimaryKey($client_id))
+                    ->whereIn('status_id', [Invoice::STATUS_DRAFT, Invoice::STATUS_SENT, Invoice::STATUS_PARTIAL])
+                    ->where('is_deleted', 0)
+                    ->where('balance', '>', 0);
+    }
+
+    public function project_id(string $project_id = ''): Builder
+    {
+        if (strlen($project_id) == 0) {
+            return $this->builder;
+        }
+
+        $decoded = $this->decodePrimaryKey($project_id);
+
+        return $this->builder
+            ->where('project_id', $decoded)
+            ->whereExists(function ($query) use ($decoded) {
+                $query->selectRaw('1')
+                    ->from('projects')
+                    ->where('projects.id', $decoded)
+                    ->where('projects.company_id', auth()->user()->companyId());
+            });
+    }
+
+    /**
+     * @param string $date
+     * @return Builder
+     * @throws InvalidArgumentException
+     */
+    public function date(string $date = ''): Builder
+    {
+        // Canonical prefix `op:value` (e.g. `gte:2026-01-01`); a bare
+        // date keeps the historical `>=`. `date` is a true DATE column,
+        // so the plain indexed where() is day-granular + safe no-op on
+        // malformed input — see QueryFilters::comparableDate().
+        return $this->comparableDate('date', $date, '>=');
+    }
+
+    /**
+     * @param string $date
+     * @return Builder
+     * @throws InvalidArgumentException
+     */
+    public function due_date(string $date = ''): Builder
+    {
+        // Was previously `Carbon::parse()` with NO try/catch — an
+        // `op:value` wire would 500. comparableDatetime() parses the op
+        // prefix and swallows malformed input. `due_date` is a DATETIME
+        // column → index-safe per-calendar-day range, not whereDate().
+        return $this->comparableDatetime('due_date', $date, '>=');
+    }
+
+    /**
+     * Sorts the list based on $sort.
+     *
+     * @param string $sort formatted as column|asc
+     * @return Builder
+     */
+    public function sort(string $sort = ''): Builder
+    {
+        $sort_col = explode('|', $sort);
+        
+        if (!is_array($sort_col)
+        || count($sort_col) != 2
+        || (!in_array($sort_col[0], \Illuminate\Support\Facades\Schema::getColumnListing($this->builder->getModel()->getTable()))
+            && !str_starts_with($sort_col[0], 'client.')
+            && !str_starts_with($sort_col[0], 'contact.')
+            && !str_starts_with($sort_col[0], 'documents'))) {
+            return $this->builder;
+        }
+
+        $dir = ($sort_col[1] == 'asc') ? 'asc' : 'desc';
+
+        // Handle relationship-based sorting
+        if ($sort_col[0] == 'documents') {
+            return $this->builder->withCount('documents')->orderBy('documents_count', $dir);
+        }
+
+        if (in_array($sort_col[0], ['client.name','client_id'])) {
+
+            /**
+             * future options for order by raw if this is not performant:
+             *
+                COALESCE(
+                                    NULLIF((SELECT name FROM clients WHERE clients.id = invoices.client_id LIMIT 1), ''),
+                                    (SELECT email FROM client_contacts
+                                     WHERE client_contacts.client_id = invoices.client_id
+                                     AND client_contacts.email IS NOT NULL
+                                     ORDER BY client_contacts.is_primary DESC, client_contacts.id ASC
+                                     LIMIT 1),
+                                    'No Contact Set'
+                                ) " . $dir
+
+             */
+
+            return $this->builder
+                ->orderByRaw(
+                    "
+                    CASE 
+                        WHEN CHAR_LENGTH((SELECT name FROM clients WHERE clients.id = invoices.client_id LIMIT 1)) > 1 
+                            THEN (SELECT name FROM clients WHERE clients.id = invoices.client_id LIMIT 1)
+                        WHEN CHAR_LENGTH(CONCAT(
+                            COALESCE((SELECT first_name FROM client_contacts WHERE client_contacts.client_id = invoices.client_id AND client_contacts.email IS NOT NULL ORDER BY client_contacts.is_primary DESC, client_contacts.id ASC LIMIT 1), ''), 
+                            COALESCE((SELECT last_name FROM client_contacts WHERE client_contacts.client_id = invoices.client_id AND client_contacts.email IS NOT NULL ORDER BY client_contacts.is_primary DESC, client_contacts.id ASC LIMIT 1), '')
+                        )) >= 1 
+                            THEN TRIM(CONCAT(
+                                COALESCE((SELECT first_name FROM client_contacts WHERE client_contacts.client_id = invoices.client_id AND client_contacts.email IS NOT NULL ORDER BY client_contacts.is_primary DESC, client_contacts.id ASC LIMIT 1), ''), 
+                                ' ', 
+                                COALESCE((SELECT last_name FROM client_contacts WHERE client_contacts.client_id = invoices.client_id AND client_contacts.email IS NOT NULL ORDER BY client_contacts.is_primary DESC, client_contacts.id ASC LIMIT 1), '')
+                            ))
+                        WHEN CHAR_LENGTH((SELECT email FROM client_contacts WHERE client_contacts.client_id = invoices.client_id AND client_contacts.email IS NOT NULL ORDER BY client_contacts.is_primary DESC, client_contacts.id ASC LIMIT 1)) > 0 
+                            THEN (SELECT email FROM client_contacts WHERE client_contacts.client_id = invoices.client_id AND client_contacts.email IS NOT NULL ORDER BY client_contacts.is_primary DESC, client_contacts.id ASC LIMIT 1)
+                        ELSE 'No Contact Set'
+                    END " . $dir
+                );
+
+        }
+
+        if ($sort_col[0] == 'project_id') {
+
+            return $this->builder->orderByRaw('ISNULL(project_id), project_id ' . $dir)
+                             ->orderBy(\App\Models\Project::select('name')
+                             ->whereColumn('projects.id', 'invoices.project_id'), $dir);
+
+        }
+
+        if ($sort_col[0] == 'number') {
+            return $this->builder->orderByRaw("REGEXP_REPLACE(invoices.number,'[^0-9]+','')+0 " . $dir);
+        }
+
+        if ($sort_col[0] == 'status_id') {
+            // Special handling for status_id==2 (STATUS_SENT) with sub-statuses
+            return $this->builder->orderByRaw("
+                CASE 
+                    WHEN status_id != 2 THEN status_id
+                    WHEN status_id = 2 AND  (due_date IS NOT NULL AND (due_date < NOW() OR partial_due_date < NOW())) THEN 2.9
+                    WHEN status_id = 2 AND last_viewed IS NOT NULL THEN 2.5
+                    WHEN status_id = 2 THEN 2.2
+                    ELSE status_id
+                END " . $dir);
+
+        }
+
+        /** Relationship sorting - clients */
+        if (str_starts_with($sort_col[0], 'client.')) {
+
+            $client_parts = explode('.', $sort_col[0]);
+
+            if (!isset($client_parts[1]) || !in_array($client_parts[1], \Illuminate\Support\Facades\Schema::getColumnListing('clients'))) {
+                return $this->builder;
+            }
+
+
+            if ($sort_col[0] === 'client.country_id') {
+                return $this->builder->orderBy(
+                    \App\Models\Client::select('countries.name')
+                            ->join('countries', 'countries.id', '=', 'clients.country_id')
+                            ->whereColumn('clients.id', 'invoices.client_id')
+                            ->limit(1),
+                    $dir
+                );
+            }
+
+            return $this->builder->orderBy(\App\Models\Client::select($client_parts[1])
+                        ->whereColumn('clients.id', 'invoices.client_id')
+                        ->limit(1), $dir);
+
+        }
+
+        /** Relationship sorting - contacts */
+        if (str_starts_with($sort_col[0], 'contact.')) {
+
+            $client_parts = explode('.', $sort_col[0]);
+
+            if (!isset($client_parts[1]) || !in_array($client_parts[1], \Illuminate\Support\Facades\Schema::getColumnListing('client_contacts'))) {
+                return $this->builder;
+            }
+
+            return $this->builder->orderBy(\App\Models\ClientContact::select($client_parts[1])
+                        ->whereColumn('client_contacts.client_id', 'invoices.client_id')
+                        ->limit(1), $dir);
+
+        }
+
+        return $this->builder->orderBy("{$this->builder->getQuery()->from}." . $sort_col[0], $dir);
+    }
+
+    /**
+     * Ensure we pad out additional includes to prevent N+1 queries.
+     *
+     * @param  string $includes
+     * @return Builder
+     */
+    public function include(string $includes = ''): Builder
+    {
+        if (trim($includes) === '') {
+            return $this->builder;
+        }
+
+        $requested_includes = array_values(array_filter(
+            array_map('trim', explode(',', $includes)),
+            static fn (string $include): bool => $include !== ''
+        ));
+
+        $include_roots = array_map(
+            static fn (string $include): string => explode('.', trim($include), 2)[0],
+            $requested_includes
+        );
+
+        if (in_array('client', $include_roots, true)) {
+            $this->builder->with([
+                'client.locations',
+            ]);
+        }
+
+        return $this->builder;
+    }
+
+    /**
+     * Filters the query by the users company ID.
+     *
+     * We need to ensure we are using the correct company ID
+     * as we could be hitting this from either the client or company auth guard
+     *
+     * @return Builder
+     */
+    public function entityFilter(): Builder
+    {
+        if (auth()->guard('contact')->user()) {
+            return $this->contactViewFilter();
+        } else {
+            return $this->builder->company()->with(['invitations.company'], ['documents.company']);
+        }
+    }
+
+    /**
+     * @param string $filter
+     * @return Builder
+     * @throws InvalidArgumentException
+     */
+    public function private_notes($filter = ''): Builder
+    {
+        if (strlen($filter) == 0) {
+            return $this->builder;
+        }
+
+        return $this->builder->where('private_notes', 'LIKE', '%' . $filter . '%');
+    }
+
+    /**
+     * We need additional filters when showing invoices for the
+     * client portal. Need to automatically exclude drafts and cancelled invoices.
+     *
+     * @return Builder
+     */
+    private function contactViewFilter(): Builder
+    {
+        return $this->builder
+                    ->whereCompanyId(auth()->guard('contact')->user()->company->id)
+                    ->whereNotIn('status_id', [Invoice::STATUS_DRAFT, Invoice::STATUS_CANCELLED]);
+    }
+}

@@ -1,0 +1,1 @@
+import{n as e}from"./useFormatMoney-DMllPbA5.js";function t(){let t=e();return e=>{let n=t(e);return n?{decimalSeparator:n.decimal_separator,precision:n.precision,thousandSeparator:n.thousand_separator}:null}}export{t};

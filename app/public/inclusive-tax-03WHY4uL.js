@@ -1,0 +1,1 @@
+import{c as e}from"./useFormatMoney-DMllPbA5.js";var t={backout(t,n,r=2){let i=n.reduce((e,t)=>e+(t||0),0),a=n.map(n=>!n||i<=0?0:e(t*n/(100+i),r)),o=e(a.reduce((e,t)=>e+t,0),r);return{net:e(t-o,r),tax:o,components:a}}};export{t};

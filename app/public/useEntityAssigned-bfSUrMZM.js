@@ -1,0 +1,1 @@
+import{vr as e}from"./forms-D87SCpr9.js";import{t}from"./useHasPermission-Cw7KmHU0.js";function n(){let n=e(),{isAdmin:r,isOwner:i}=t();return(e,t)=>{if(t)return!!(n&&e&&e.user_id===n.id)||r||i;let a=n&&e&&`assigned_user_id`in e&&e.assigned_user_id===n.id;return!!(n&&e&&(e.user_id===n.id||a||r||i))}}export{n as t};

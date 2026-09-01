@@ -1,0 +1,360 @@
+<?php
+
+/**
+ * Invoice Ninja (https://invoiceninja.com).
+ *
+ * @link https://github.com/invoiceninja/invoiceninja source repository
+ *
+ * @copyright Copyright (c) 2026. Invoice Ninja LLC (https://invoiceninja.com)
+ *
+ * @license https://www.elastic.co/licensing/elastic-license
+ */
+
+namespace App\Services\EDocument\Jobs;
+
+use Mail;
+use App\Utils\Ninja;
+use App\Models\Invoice;
+use App\Models\Credit;
+use App\Models\Activity;
+use App\Models\SystemLog;
+use App\Libraries\MultiDB;
+use App\Models\EInvoicingLog;
+use App\Services\Email\Email;
+use Illuminate\Bus\Queueable;
+use App\Jobs\Util\SystemLogger;
+use App\Services\Email\EmailObject;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Mail\Mailables\Address;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use App\Services\EDocument\Standards\Peppol;
+use Illuminate\Queue\Middleware\WithoutOverlapping;
+use App\Services\EDocument\Gateway\Storecove\Storecove;
+use App\Services\EDocument\Gateway\Storecove\RoutingResolver;
+
+class SendEDocument implements ShouldQueue
+{
+    use Dispatchable;
+    use InteractsWithQueue;
+    use Queueable;
+    use SerializesModels;
+
+    public $tries = 5;
+
+    public $deleteWhenMissingModels = true;
+
+    public function __construct(private string $entity, private int $id, private string $db) {}
+
+    /**
+     * Processes and sends an e-invoice/credit via the Storecove gateway,
+     * handling self-hosted and hosted code paths, quota management, and activity logging.
+     *
+     * @param  Storecove $storecove
+     * @return array|void
+     */
+    public function handle(Storecove $storecove)
+    {
+        MultiDB::setDB($this->db);
+
+        nlog("trying to send {$this->entity} {$this->id} on {$this->db}");
+
+        /** Hydrate model for sending */
+        $model = $this->entity::withTrashed()->find($this->id);
+
+        /** Guard clauses ensuring model is in a valid sending state */
+        if (!$model || $model->is_deleted) {
+            nlog("Model not found or deleted");
+            return; // Model not found.
+        }
+
+        if (isset($model->backup->guid) && is_string($model->backup->guid) && strlen($model->backup->guid) > 3) {
+            nlog("Already sent!");
+            return; //Do not double send.
+        }
+
+        if ($model->company->account->is_flagged) {
+            nlog("Bad Actor");
+            return; //Bad Actor present.
+        }
+
+        /** Ensure client is routable on the PEPPOL Network */
+        if ($model->client && ($error = $model->client->checkDeliveryNetwork())) {
+            nlog("Client is not routable on the Peppol network: {$error}");
+            $this->writeActivity($model, Activity::EINVOICE_DELIVERY_FAILURE, $error);
+            return;
+        }
+
+        $model = $model->service()->markSent()->save();
+
+        // ── Step 1: Build Peppol UBL document (once) ──
+        $peppol = new Peppol($model);
+        $peppol->run();
+
+        // ── Step 2: Resolve routing (fail-fast) ──
+        $resolver = new RoutingResolver($model, $storecove->proxy, $storecove->router);
+        $routingResult = $resolver->resolve();
+
+        if ($routingResult['type'] === 'none') {
+            nlog("Client {$model->client->present()->name()} could not be discovered on the PEPPOL network");
+            $this->writeActivity($model, Activity::EINVOICE_DELIVERY_FAILURE, ctrans('texts.client_not_found_on_peppol_network'));
+            return;
+        }
+
+        $routing = $routingResult['meta']['routing'] ?? [];
+        if (!empty($routingResult['networks'])) {
+            $routing['networks'] = $routingResult['networks'];
+        }
+
+        if (!isset($routing['eIdentifiers']) && !isset($routing['emails'])) {
+            nlog("Client {$model->client->present()->name()} could not be discovered on the PEPPOL network");
+            $this->writeActivity($model, Activity::EINVOICE_DELIVERY_FAILURE, ctrans('texts.client_not_found_on_peppol_network'));
+            return;
+        }
+
+        // ── Step 3: Serialize to Storecove + decorate ──
+        $storecove->adapter
+            ->transformFromPeppol($model, $peppol->getDocument(), $peppol->isCreditNote())
+            ->decorate();
+
+        $result = $storecove->adapter->getDocument();
+
+        if (count($result['errors']) > 0) {
+            nlog($result);
+            return $result['errors'];
+        }
+
+        // nlog($result['document']);
+        
+        // ── Step 4: Assemble payload ──
+        $payload = [
+            'legal_entity_id' => $model->company->legal_entity_id,
+            "idempotencyGuid" => \Illuminate\Support\Str::uuid()->toString(),
+            'document' => [
+                'document_type' => 'invoice',
+                'invoice' => $result['document'],
+            ],
+            'tenant_id' => $model->company->company_key,
+            'routing' => $routing,
+            'account_key' => $model->company->account->key,
+            'e_invoicing_token' => $model->company->account->e_invoicing_token,
+        ];
+
+        // nlog($routing);
+        // nlog("payload", $payload);
+
+        //Self Hosted Sending Code Path
+        if (Ninja::isSelfHost() && ($model instanceof Invoice || $model instanceof Credit) && $model->company->peppolSendingEnabled()) {
+
+            $r = Http::withHeaders([...$this->getHeaders(), 'X-EInvoice-Token' => $model->company->account->e_invoicing_token])
+                ->post(config('ninja.hosted_ninja_url') . "/api/einvoice/submission", $payload);
+
+            if ($r->successful()) {
+
+                if ($r->hasHeader('X-EINVOICE-QUOTA')) {
+                    $account = $model->company->account;
+                    $account->e_invoice_quota = (int) $r->header('X-EINVOICE-QUOTA');
+                    $account->save();
+                }
+
+                nlog("Model {$model->number} was successfully sent for third party processing via hosted Invoice Ninja");
+                $data = $r->json();
+                $this->writeActivity($model, Activity::EINVOICE_DELIVERY_SUCCESS, $data['guid']);
+                return;
+            }
+
+            if ($r->failed()) {
+                nlog("Model {$model->number} failed to be accepted by invoice ninja, error follows:");
+                nlog($r->json());
+                (
+                    new SystemLogger(
+                        $r->json(),
+                        SystemLog::CATEGORY_PEPPOL,
+                        SystemLog::EVENT_PEPPOL_FAILURE,
+                        SystemLog::TYPE_PEPPOL_SEND,
+                        $model->client,
+                        $model->company
+                    )
+                )->handle();
+                
+                $this->writeActivity($model, Activity::EINVOICE_DELIVERY_FAILURE, data_get($r->json(), 'errors.0.details', 'Unhandled error, check logs'));
+            }
+
+        } elseif (Ninja::isSelfHost()) {
+            return;
+        }
+
+        //Run this check outside of the next loop as it will never send otherwise.
+        if ($model->company->account->e_invoice_quota == 0 && $model->company->legal_entity_id) {
+            $key = "e_invoice_quota_exhausted_{$model->company->account->key}";
+
+            if (! Cache::has($key)) {
+                $mo = new EmailObject();
+                $mo->subject = ctrans('texts.notification_no_credits');
+                $mo->body = ctrans('texts.notification_no_credits_text');
+                $mo->text_body = ctrans('texts.notification_no_credits_text');
+                $mo->company_key = $model->company->company_key;
+                $mo->html_template = 'email.template.generic';
+                $mo->to = [new Address($model->company->account->owner()->email, $model->company->account->owner()->name())];
+                $mo->email_template_body = 'notification_no_credits';
+                $mo->email_template_subject = 'notification_no_credits_text';
+
+                Email::dispatch($mo, $model->company);
+                Cache::put($key, true, now()->addHours(24));
+            }
+
+            return;
+        }
+
+        //Hosted Sending Code Path.
+        if (($model instanceof Invoice || $model instanceof Credit) && $model->company->peppolSendingEnabled()) {
+            if ($model->company->account->e_invoice_quota <= config('ninja.e_invoice_quota_warning')) {
+                $key = "e_invoice_quota_low_{$model->company->account->key}";
+
+                if (! Cache::has($key)) {
+                    $mo = new EmailObject();
+                    $mo->subject = ctrans('texts.notification_credits_low');
+                    $mo->body = ctrans('texts.notification_credits_low_text');
+                    $mo->text_body = ctrans('texts.notification_credits_low_text');
+                    $mo->company_key = $model->company->company_key;
+                    $mo->html_template = 'email.template.generic';
+                    $mo->to = [new Address($model->company->account->owner()->email, $model->company->account->owner()->name())];
+                    $mo->email_template_body = 'notification_credits_low';
+                    $mo->email_template_subject = 'notification_credits_low_text';
+
+                    Email::dispatch($mo, $model->company);
+                    Cache::put($key, true, now()->addHours(24));
+                }
+            }
+
+            $sc = new \App\Services\EDocument\Gateway\Storecove\Storecove();
+            $r = $sc->sendJsonDocument($payload);
+
+            // Successful send - update quota!
+            if (is_string($r)) {
+
+                $account = $model->company->account;
+                $account->decrement('e_invoice_quota', 1);
+                $account->refresh();
+
+                EInvoicingLog::create([
+                    'tenant_id' => $model->company->company_key,
+                    'direction' => 'sent',
+                    'legal_entity_id' => $model->company->legal_entity_id,
+                    'notes' => $r,
+                    'counter' => -1,
+                ]);
+
+                if ($account->e_invoice_quota == 0 && class_exists(\Modules\Admin\Jobs\Account\SuspendESendReceive::class)) {
+                    \Modules\Admin\Jobs\Account\SuspendESendReceive::dispatch($account->key);
+                }
+
+                $this->writeActivity($model, Activity::EINVOICE_DELIVERY_SUCCESS, $r);
+                return;
+            }
+
+            if ($r->failed()) {
+                nlog("Model {$model->number} failed to be accepted by invoice ninja, error follows:");
+                $notes = data_get($r->json(), 'errors.0.details', 'Unhandled errors, check logs');
+                $this->writeActivity($model, Activity::EINVOICE_DELIVERY_FAILURE, $notes);
+                return;
+            }
+
+        }
+
+    }
+
+    /**
+     * writeActivity
+     *
+     * @param  mixed $model
+     * @param  int $activity_id
+     * @param  string $notes
+     * @return void
+     */
+    /**
+     * Records an e-invoicing activity (success or failure) and stores the
+     * Storecove GUID on the model backup when delivery succeeds.
+     *
+     * @param  \App\Models\Invoice|\App\Models\Credit $model
+     * @param  int $activity_id
+     * @param  string $notes
+     * @return void
+     */
+    private function writeActivity($model, int $activity_id, string $notes = '')
+    {
+        $activity = new Activity();
+        $activity->user_id = $model->user_id;
+        $activity->client_id = $model->client_id ?? $model->vendor_id;
+        $activity->company_id = $model->company_id;
+        $activity->account_id = $model->company->account_id;
+        $activity->activity_type_id = $activity_id;
+        $activity->invoice_id = ($model instanceof Invoice) ? $model->id : null;
+        $activity->credit_id = ($model instanceof Credit) ? $model->id : null;
+        $activity->notes = str_replace('"', '', $notes);
+        $activity->is_system = true;
+
+        $activity->save();
+
+        if ($activity_id == Activity::EINVOICE_DELIVERY_SUCCESS) {
+            $model->backup->guid = str_replace('"', '', $notes);
+            $model->saveQuietly();
+
+        }
+
+    }
+
+    /**
+     * Self hosted request headers
+     *
+     **/
+    private function getHeaders(): array
+    {
+        return [
+            'X-API-SELF-HOST-TOKEN' => config('ninja.license_key'),
+            "X-Requested-With" => "XMLHttpRequest",
+            "Content-Type" => "application/json",
+        ];
+    }
+
+    /**
+     * middleware
+     *
+     * @return array
+     */
+    public function middleware(): array
+    {
+        return [(new WithoutOverlapping($this->entity . $this->id . $this->db))->releaseAfter(60)->expireAfter(60)];
+    }
+
+    /**
+     * backoff
+     *
+     * @return array
+     */
+    public function backoff()
+    {
+        return [rand(5, 29), rand(30, 59), rand(240, 360), 3600, 7200];
+    }
+
+
+    /**
+     * failed
+     *
+     * @param  mixed $exception
+     * @return void
+     */
+    public function failed($exception = null)
+    {
+        if ($exception) {
+            nlog("EXCEPTION:: SENDEDOCUMENT::");
+            nlog($exception->getMessage());
+        }
+
+    }
+
+
+}

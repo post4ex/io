@@ -1,0 +1,1 @@
+var e={vendor_contact_id:``,client_contact_id:``,is_deleted:!1,isChanged:!1,key:``,link:``,opened_date:``,sent_date:``,viewed_date:``,created_at:0,archived_at:0,updated_at:0};export{e as t};

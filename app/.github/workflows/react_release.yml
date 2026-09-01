@@ -1,0 +1,190 @@
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+
+name: React Release
+
+jobs:
+  check-dockerfiles-token:
+    name: Check Dockerfiles Token
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe DOCKERFILES_RELEASE_TOKEN
+        env:
+          GH_TOKEN: ${{ secrets.DOCKERFILES_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "=== Identity ==="
+          gh api user --jq '"login=\(.login) type=\(.type) id=\(.id)"'
+
+          echo "=== Token scopes ==="
+          gh api -i user | tr -d '\r' | grep -iE '^(x-oauth-scopes|x-accepted-oauth-scopes|github-authentication-token-expiration):' || echo "No classic OAuth scope headers (likely a fine-grained token)"
+
+          echo "=== dockerfiles permissions ==="
+          gh api repos/invoiceninja/dockerfiles --jq '{full_name, private, permissions}'
+
+          echo "=== Can list dockerfiles releases ==="
+          gh release list --repo invoiceninja/dockerfiles --limit 3
+
+          echo "=== Can read branch heads used as tag targets ==="
+          gh api repos/invoiceninja/dockerfiles/git/ref/heads/master --jq '"master=\(.object.sha)"'
+          gh api repos/invoiceninja/dockerfiles/git/ref/heads/octane --jq '"octane=\(.object.sha)"'
+          gh api repos/invoiceninja/dockerfiles/git/ref/heads/debian --jq '"debian=\(.object.sha)"'
+
+          PUSH=$(gh api repos/invoiceninja/dockerfiles --jq '.permissions.push')
+          if [[ "${PUSH}" != "true" ]]; then
+            echo "DOCKERFILES_RELEASE_TOKEN cannot push to invoiceninja/dockerfiles; release creation will fail"
+            exit 1
+          fi
+
+          echo "DOCKERFILES_RELEASE_TOKEN can push to invoiceninja/dockerfiles and is usable by gh"
+
+  build:
+    name: Upload Release Asset
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 8.2
+          extensions: mysql, mysqlnd, sqlite3, bcmath, gd, curl, zip, openssl, mbstring, xml
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: v5-develop
+          fetch-depth: 1
+
+      - name: Install composer dependencies
+        run: |
+          composer config -g github-oauth.github.com ${{ secrets.GITHUB_TOKEN }}
+          composer install --no-dev -o
+
+      - name: Set current date to variable
+        id: set_date
+        run: echo "current_date=$(date '+%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          
+      - name: Prepare React FrontEnd
+        run: |
+          git clone https://${{secrets.commit_secret}}@github.com/invoiceninja/ui.git
+          cd ui
+          git checkout develop
+          sed -i 's/VITE_IS_TEST=true/VITE_IS_TEST=false/' .env.example
+          echo VITE_PUSHER_APP_KEY=f0111a02782708da651f >> .env.example
+
+          cp .env.example .env
+          cp ../vite.config.ts.react ./vite.config.js
+          sed -i '/"version"/c\  "version": " Latest Build - ${{ env.current_date }}",' package.json
+          npm i
+          npm run build
+          cp -r dist/* ../public/
+          mv ../public/index.html ../resources/views/react/index.blade.php
+
+      - name: Prepare JS/CSS assets
+        run: |
+          npm i
+          npm run production
+
+      - name: Cleanup Builds
+        run: |
+          rm -rf node_modules
+          rm -rf .git
+          rm .env || true
+          rm -rf ui || true
+          # Set permissions: directories 755, files 644
+          find . -path ./vendor -prune -o -type f -exec chmod 644 {} \+
+          find . -path ./vendor -prune -o -type d -exec chmod 755 {} \+
+
+      - name: Build project
+        run: |
+          shopt -s dotglob
+          tar --exclude='public/storage' --exclude='invoiceninja.zip' -zcvf /home/runner/work/invoiceninja/invoiceninja.tar *
+          tar --exclude='public/storage' --exclude='invoiceninja.zip' -zcvf /home/runner/work/invoiceninja/invoiceninja.tar.gz *
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: |
+            /home/runner/work/invoiceninja/invoiceninja.tar
+            /home/runner/work/invoiceninja/invoiceninja.tar.gz
+
+  tag-dockerfiles:
+    name: Tag Dockerfiles Releases
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' && startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Confirm release tarball is available
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/invoiceninja.tar.gz"
+          for i in $(seq 1 18); do
+            HTTP_CODE=$(curl -sL -o /dev/null -w "%{http_code}" "$URL")
+            if [[ "${HTTP_CODE}" == "200" ]]; then
+              echo "Release asset is available: ${URL}"
+              exit 0
+            fi
+            echo "Waiting for ${URL} (HTTP ${HTTP_CODE}), attempt ${i}/18"
+            sleep 10
+          done
+          echo "Timed out waiting for ${URL}"
+          exit 1
+
+      - name: Create dockerfiles releases
+        env:
+          GH_TOKEN: ${{ secrets.DOCKERFILES_RELEASE_TOKEN }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          SOURCE_URL: ${{ github.event.release.html_url }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${SOURCE_TAG#v}"
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Skipping dockerfiles tags for non-semver tag ${SOURCE_TAG}"
+            exit 0
+          fi
+
+          NOTES="Invoice Ninja ${SOURCE_TAG}: ${SOURCE_URL}"
+          REPO="invoiceninja/dockerfiles"
+          FAILED=0
+
+          create_release() {
+            local tag="$1"
+            local target="$2"
+            local latest_flag="$3"
+
+            if gh release view "${tag}" --repo "${REPO}" >/dev/null 2>&1; then
+              echo "Release ${tag} already exists on ${REPO}, skipping"
+              return 0
+            fi
+
+            echo "Creating ${tag} on ${REPO} (${target})"
+            if ! gh release create "${tag}" \
+              --repo "${REPO}" \
+              --target "${target}" \
+              --title "${tag}" \
+              --notes "${NOTES}" \
+              --generate-notes \
+              --latest="${latest_flag}"; then
+              echo "Failed to create ${tag}"
+              return 1
+            fi
+          }
+
+          create_release "${VERSION}" "master" "false" || FAILED=1
+          create_release "${VERSION}-o" "octane" "false" || FAILED=1
+          create_release "${VERSION}-d" "debian" "true" || FAILED=1
+
+          exit "${FAILED}"

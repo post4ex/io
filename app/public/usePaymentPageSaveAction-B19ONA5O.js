@@ -1,0 +1,1 @@
+import{a as e}from"./rolldown-runtime-CNC7AqOf.js";import{t}from"./react-Augu_vA3.js";import{Jr as n,Yr as r}from"./forms-D87SCpr9.js";var i=e(t(),1),a=r(null);function o(e,t=[]){let r=n(a);(0,i.useEffect)(()=>(r(e),()=>r(null)),t)}export{o as n,a as t};

@@ -1,0 +1,1 @@
+import{t as e}from"./useGetSetting-BOnf9pgg.js";function t(){let t=e();return e=>{if(!e)return!1;let n=t(e,`company_gateway_ids`);return n===`0`||n===null?!1:n===void 0||n.split(`,`).length>0}}export{t};
